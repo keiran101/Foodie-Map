@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>foodmap API 文档 - 创建合集</title>
+<style>
+body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 0 auto; padding: 24px 16px 60px; color: #1f2937; line-height: 1.7; }
+h1 { font-size: 1.6em; border-bottom: 2px solid #f97316; padding-bottom: 8px; }
+h2 { font-size: 1.2em; margin-top: 32px; color: #ea580c; }
+code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+pre { background: #111827; color: #e5e7eb; padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.88em; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+th, td { border: 1px solid #e5e7eb; padding: 8px 10px; text-align: left; font-size: 0.92em; }
+th { background: #fff7ed; }
+.warn { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 10px 14px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>foodmap 美食探店地图 · API 文档</h1>
+<p>把店铺清单一键生成可导航的美食合集地图。本页为开发者/Agent 调用说明，机器可读版本见 <a href="/llms.txt">/llms.txt</a>。</p>
+
+<h2>核心端点：创建合集（一个请求完成）</h2>
+<pre><code>POST http://8.134.63.180:3000/api/collections/generate
+Authorization: Bearer &lt;token&gt;
+Content-Type: application/json
+
+{
+  "title": "周末深圳火锅巡礼",
+  "city": "深圳",
+  "places": [
+    { "name": "蜀大侠火锅" },
+    { "name": "周记肠粉王" }
+  ]
+}</code></pre>
+<p>响应 201：<code>{"mapId":"...","url":"http://8.134.63.180:3000/maps/...","added":2,"missing":[]}</code> —— <code>url</code> 即合集页面链接；<code>missing</code> 列出搜不到的店。</p>
+
+<h2>第一步：获取凭证</h2>
+<table>
+<tr><th>接口</th><th>说明</th></tr>
+<tr><td>POST /api/auth/register</td><td>注册：{email, password, nickname}</td></tr>
+<tr><td>POST /api/auth/login</td><td>登录：{email, password} → 返回 accessToken（15分钟）</td></tr>
+<tr><td>POST /api/auth/refresh</td><td>续期：{refreshToken} → 新 token</td></tr>
+</table>
+
+<h2>辅助接口</h2>
+<table>
+<tr><th>接口</th><th>说明</th></tr>
+<tr><td>GET /api/geo/search?keyword=店名&amp;city=城市</td><td>按店名搜索坐标（无需鉴权）</td></tr>
+<tr><td>GET /api/maps?city=城市</td><td>浏览公开合集</td></tr>
+</table>
+
+<div class="warn">⚠️ <b>城市很重要</b>：店名缺坐标时服务端用高德自动补全，必须提供 <code>city</code>（顶层或每家店），否则可能匹配到错误城市的同名店。</div>
+
+<h2>请求参数说明</h2>
+<table>
+<tr><th>字段</th><th>必填</th><th>说明</th></tr>
+<tr><td>title</td><td>是</td><td>合集标题，≤60 字</td></tr>
+<tr><td>city</td><td>建议</td><td>城市（如"深圳"），用于坐标补全</td></tr>
+<tr><td>places[].name</td><td>是</td><td>店名</td></tr>
+<tr><td>places[].city</td><td>否</td><td>单店城市，覆盖顶层 city</td></tr>
+<tr><td>places[].lng/lat</td><td>否</td><td>已有坐标可直传，跳过搜索</td></tr>
+<tr><td>places[].address/category/phone</td><td>否</td><td>可选补充信息</td></tr>
+</table>
+</body>
+</html>

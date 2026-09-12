@@ -1,0 +1,57 @@
+# foodmap 美食探店地图
+
+> 把店铺清单一键生成可导航的美食合集地图。用户会让 Agent 帮忙创建合集：给定店铺列表（店名+城市），生成合集并返回链接。
+
+## 服务地址
+- 网站与 API 统一入口：http://8.134.63.180:3000
+- 注意：当前为 HTTP 明文传输
+
+## Agent 能力速览
+- **创建合集（核心）**：POST /api/collections/generate —— 传标题/城市/店铺名称数组，服务端自动搜索坐标并生成合集，返回合集链接
+- 搜索店铺坐标：GET /api/geo/search?keyword=店名&city=城市（无鉴权）
+- 浏览公开合集：GET /api/maps?city=城市
+- 认证：POST /api/auth/register、POST /api/auth/login、POST /api/auth/refresh
+
+## 创建合集操作手册（Agent 按此执行）
+
+### 1. 获取凭证
+- 用户无账号时注册：POST /api/auth/register，body {"email":"任意邮箱","password":"至少6位","nickname":"昵称"}
+- 登录：POST /api/auth/login，body {"email":"...","password":"..."} → 响应含 accessToken、refreshToken
+- 后续所有写请求头加：Authorization: Bearer <accessToken>
+- accessToken 15 分钟过期；过期后用 refreshToken 调 POST /api/auth/refresh（body {"refreshToken":"..."}）续期，得到新 token 后重试原请求
+
+### 2. 调用聚合端点（核心）
+POST /api/collections/generate
+- Header：Authorization: Bearer <token>，Content-Type: application/json
+- Body：
+{
+  "title": "合集标题（必填，≤60字）",
+  "city": "城市（强烈建议，如"深圳"；坐标补全依赖它）",
+  "description": "可选",
+  "visibility": "PUBLIC | UNLISTED | PRIVATE（默认 PUBLIC）",
+  "places": [
+    { "name": "店名（必填）" },
+    { "name": "另一家店", "city": "单店城市（可选，覆盖顶层）" }
+  ]
+}
+- 成功 201 响应：
+{
+  "mapId": "cm...",
+  "title": "合集标题",
+  "url": "http://8.134.63.180:3000/maps/cm...",
+  "added": 5,
+  "missing": ["未找到的店名"],
+  "visibility": "PUBLIC"
+}
+- url 即合集页面链接，可发给用户
+
+### 3. 注意事项（重要）
+- **必须提供 city**（顶层或每家店 city 字段）：店名缺坐标时服务端自动用高德搜索补全，城市不准确会匹配到错误城市的同名店
+- 每家店可选字段：address、category、phone、lng、lat、amapPoiId（有坐标可直传，跳过搜索）
+- missing 数组 = 高德搜不到的店（店名可能不准确或不存在），可提示用户核对后补传
+- 错误响应：400 参数不合法（含 detail 字段说明原因）、401 未登录/token 失效、403 无权限
+
+## 用户常见指令示例
+- 用户说"把这几家店建成合集：蜀大侠火锅、小龙坎，深圳的" → 直接调 generate（title 可让用户确认或按内容拟）
+- 用户说"帮我建一个成都小面合集"但没给店 → 先询问店铺清单，拿到后调 generate
+- 用户给了一段视频评论/探店清单（含店名和地名）→ 提取店名和城市，调 generate

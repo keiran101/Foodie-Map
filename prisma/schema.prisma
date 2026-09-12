@@ -1,0 +1,206 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Visibility {
+  PUBLIC
+  UNLISTED
+  PRIVATE
+}
+
+enum NavProvider {
+  AMAP
+  BAIDU
+  TENCENT
+}
+
+enum ParseStatus {
+  PENDING
+  PROCESSING
+  DONE
+  FAILED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  nickname     String
+  avatar       String?
+  bio          String?
+  isCreator    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  maps        FoodMap[]
+  collections Collection[]
+  follows     Follow[]      @relation("Following")
+  followers   Follow[]      @relation("Follower")
+  navLogs     NavLog[]
+  mapLikes    MapLike[]
+  mapDislikes MapDislike[]
+  favorites   Favorite[]
+  comments    Comment[]
+  mapForks    MapFork[]
+}
+
+model FoodMap {
+  id          String     @id @default(cuid())
+  ownerId     String
+  owner       User       @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  coverUrl    String?
+  city        String?
+  visibility  Visibility @default(PUBLIC)
+  viewCount   Int        @default(0)
+  createdAt   DateTime   @default(now())
+
+  places    Place[]
+  likes     MapLike[]
+  dislikes  MapDislike[]
+  favorites Favorite[]
+  comments  Comment[]
+  forks     MapFork[]
+
+  @@index([visibility, createdAt])
+}
+
+model Place {
+  id           String   @id @default(cuid())
+  name         String
+  address      String?
+  lng          Decimal
+  lat          Decimal
+  amapPoiId    String?
+  category     String?
+  phone        String?
+  avgPrice     Int?
+  note         String?
+  rating       Float?
+  mapId        String
+  map          FoodMap @relation(fields: [mapId], references: [id], onDelete: Cascade)
+  collectionId String?
+  collection   Collection? @relation(fields: [collectionId], references: [id], onDelete: SetNull)
+  sourceVideoId String?
+  sourceVideo SourceVideo? @relation(fields: [sourceVideoId], references: [id], onDelete: SetNull)
+  orderIndex   Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  navLogs NavLog[]
+
+  @@index([mapId, orderIndex])
+  @@index([lng, lat])
+}
+
+model Collection {
+  id         String     @id @default(cuid())
+  ownerId    String
+  owner      User       @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  title      String
+  city       String?
+  coverUrl   String?
+  visibility Visibility @default(PUBLIC)
+  placeCount Int        @default(0)
+  createdAt  DateTime   @default(now())
+
+  places Place[]
+}
+
+model Follow {
+  followerId  String
+  followingId String
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("Follower", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("Following", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@id([followerId, followingId])
+}
+
+model MapLike {
+  userId    String
+  mapId     String
+  createdAt DateTime @default(now())
+
+  user User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  map  FoodMap  @relation(fields: [mapId], references: [id], onDelete: Cascade)
+
+  @@id([userId, mapId])
+}
+
+model MapDislike {
+  userId    String
+  mapId     String
+  createdAt DateTime @default(now())
+
+  user User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  map  FoodMap  @relation(fields: [mapId], references: [id], onDelete: Cascade)
+
+  @@id([userId, mapId])
+}
+
+model Favorite {
+  userId    String
+  mapId     String
+  createdAt DateTime @default(now())
+
+  user User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  map  FoodMap  @relation(fields: [mapId], references: [id], onDelete: Cascade)
+
+  @@id([userId, mapId])
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  mapId     String
+  userId    String
+  content   String   @db.VarChar(500)
+  createdAt DateTime @default(now())
+
+  map  FoodMap @relation(fields: [mapId], references: [id], onDelete: Cascade)
+  user User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([mapId, createdAt])
+}
+
+model MapFork {
+  id          String   @id @default(cuid())
+  userId      String
+  sourceMapId String
+  newMapId    String
+  createdAt   DateTime @default(now())
+
+  user User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  map  FoodMap @relation(fields: [sourceMapId], references: [id], onDelete: Cascade)
+}
+
+model NavLog {
+  id        String      @id @default(cuid())
+  userId    String?
+  placeId   String
+  provider  NavProvider
+  createdAt DateTime    @default(now())
+
+  user  User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+  place Place @relation(fields: [placeId], references: [id], onDelete: Cascade)
+}
+
+model SourceVideo {
+  id          String      @id @default(cuid())
+  platform    String?
+  url         String
+  authorName  String?
+  title       String?
+  transcript  String?
+  parseStatus ParseStatus @default(PENDING)
+  rawJson     String?
+  mapId       String?
+  createdAt   DateTime    @default(now())
+
+  places Place[]
+}

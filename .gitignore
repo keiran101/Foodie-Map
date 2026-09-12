@@ -39,3 +39,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# agent internal data (must never be committed)
+.workbuddy/
+
+# logs
+*.log
+
+# python
+__pycache__/
+
+# archives (source tarball etc.)
+*.tar.gz
