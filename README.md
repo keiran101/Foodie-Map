@@ -58,11 +58,11 @@ foodie-map 是一个面向「探店爱好者 / 内容创作者 / Agent」的美�
 
 **合集详情页** —— 一键生成的「深圳南山 · 罗湖 · 龙华 5 家美食合集」，高德地图自动标注全部店铺，支持点赞 / 收藏 / 评论 / 复制为我的合集。
 
-![合集地图详情页](docs/screenshots/map-detail.jpg)
+<img src="docs/screenshots/map-detail.jpg" alt="合集地图详情页" width="560">
 
 **店铺列表与导航** —— 每家店铺带「导航」按钮，一键唤起高德 / 百度 / 腾讯地图。
 
-![店铺列表与导航](docs/screenshots/place-list.jpg)
+<img src="docs/screenshots/place-list.jpg" alt="店铺列表与导航" width="560">
 
 ---
 
