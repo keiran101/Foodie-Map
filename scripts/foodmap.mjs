@@ -22,7 +22,11 @@
  *   ]
  * }
  *
- * 环境变量 FOODMAP_BASE 可设置默认服务地址。
+ * 环境变量：
+ *   FOODMAP_BASE   默认服务地址（默认 http://127.0.0.1:3000）
+ *   FOODMAP_TOKEN  任务令牌。设置后**跳过本地登录态**，以该 token 所属用户身份写入。
+ *                  由平台发起 Agent 任务时签发（短效，不可 refresh）；过期即报错，
+ *                  不会回落到本地登录账号。
  */
 import fs from 'node:fs'
 import os from 'node:os'
@@ -123,7 +127,11 @@ async function cmdCreate(base, cfg, input) {
     console.log('    建议：JSON 顶层加 "city"（如 "深圳"），或给每家店加 "city" 字段')
   }
 
-  let token = cfg.accessToken
+  // 任务令牌优先：平台发起任务时签发的短效 token，代表**本次请求的那个用户**。
+  // 它不是某个固定登录用户的凭据，所以不能走 refresh —— 过期就让平台重发任务，
+  // 绝不能退回到本地登录态（会把合集建到别的账号下）。
+  const taskToken = process.env.FOODMAP_TOKEN || ''
+  let token = taskToken || cfg.accessToken
   let mapId
   let added = 0
   const missing = []
@@ -186,6 +194,11 @@ async function cmdCreate(base, cfg, input) {
     await run(token)
   } catch (e) {
     if (e.status === 401) {
+      if (taskToken) {
+        throw new Error(
+          '任务令牌被拒或已过期（FOODMAP_TOKEN）—— 请让平台重新发起任务，不要用本地登录态兜底',
+        )
+      }
       token = await refreshToken(base, cfg)
       await run(token)
     } else {

@@ -31,6 +31,26 @@ export function signRefreshToken(user: { id: string; email: string }): string {
   })
 }
 
+/** 任务级 token 的有效期。一轮要跑 取媒体→转写→校验→建图，15 分钟不够。 */
+const TASK_TTL = process.env.JWT_TASK_TTL || '45m'
+
+/**
+ * 任务级 access token —— 平台发起 Agent 任务时签发给 Agent，代表**这一个用户**回写平台。
+ *
+ * 为什么不用「服务账号 + userId 参数」：那等于给平台加一把能写任意用户的万能钥匙，
+ * 且要新增一套鉴权分支。任务级 token 完全复用现有 requireUser，权限天然锁在
+ * `sub` 指向的那个用户身上，任务结束即过期，不留长期凭据。
+ *
+ * `act: 'agent'` 只是标记来源，便于日后审计；鉴权语义与普通 access token 一致。
+ */
+export function signTaskToken(user: { id: string; email: string }): string {
+  return jwt.sign(
+    { sub: user.id, email: user.email, type: 'access', act: 'agent' },
+    JWT_SECRET,
+    { expiresIn: TASK_TTL as jwt.SignOptions['expiresIn'] },
+  )
+}
+
 export function verifyToken(token: string, expectedType: 'access' | 'refresh' = 'access'): TokenPayload | null {
   try {
     const payload = jwt.verify(token, JWT_SECRET) as TokenPayload
