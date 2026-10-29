@@ -1,0 +1,26 @@
+; systemd unit 的版本化副本 —— 服务器上的 /etc/systemd/system/foodmap.service
+; 就是这份。改这里，然后在服务器上：
+;   cp /opt/foodmap/scripts/foodmap.service /etc/systemd/system/foodmap.service
+;   systemctl daemon-reload && systemctl restart foodmap
+;
+; deploy.py 会把 scripts/ 传到 /opt/foodmap/scripts/，但**不会**自动安装到
+; /etc/systemd，因为换 unit 需要 daemon-reload 和重启，属人工决定。
+;
+; SuccessExitStatus=143 是必须的：Next 收到 SIGTERM 以 143（128+15）退出，
+; 没有这行，每次 `systemctl stop` 都会把服务记成 failed（Result: exit-code），
+; 于是「停干净了没有」这件事在 systemctl 看来永远是失败的。加上它，stop 之后
+; 状态才是干净的 inactive。见 docs/DEPLOY.md §4.3。
+
+[Unit]
+Description=foodmap next server
+After=network.target postgresql.service
+
+[Service]
+WorkingDirectory=/opt/foodmap
+ExecStart=/usr/bin/node /opt/foodmap/node_modules/next/dist/bin/next start -H 0.0.0.0 -p 3000
+Restart=always
+RestartSec=3
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target

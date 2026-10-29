@@ -40,11 +40,14 @@ frpc 只在你的工作站。在服务器上装 frpc 是错的。
 | 组件 | 位置 | 形态 |
 |---|---|---|
 | 平台代码 | `/opt/foodmap` | **不是 git 仓库**（历史部署是整目录拷的） |
-| 平台进程 | systemd `foodmap.service` | `/usr/bin/node .../next start -H 0.0.0.0 -p 3000`，`Restart=always` |
+| 平台进程 | systemd `foodmap.service` | `/usr/bin/node .../next start -H 0.0.0.0 -p 3000`，`Restart=always`、`SuccessExitStatus=143`；**版本化副本在 `scripts/foodmap.service`** |
 | 数据库 | `127.0.0.1:5433` | 原生 systemd `postgresql`（**不是** docker），库 `foodie` |
 | frps | `/root/frp_0.54.0_linux_amd64` | `bindPort=7000`，token 认证，`tls.force=true` |
 | 内存 | 1608 MB + swap 4095 MB | 构建能过，但**只能单并发** |
+| swap 策略 | `vm.swappiness = 0` | 写在 `/etc/sysctl.conf` 第 1 行（阿里云镜像默认）→ swap 基本用不上，见 §4 |
 | Node | v20.20.2 / npm 10.8.2 | |
+| Next | 16.3.0（Turbopack） | 构建实测 **16 秒**，不是分钟级 |
+| 同机邻居 | `filed_rop-filedrop-1`（docker，1158 端口，占 42MB）、`AliYunDun` | 不是本项目，别顺手停 |
 
 配置在 `/opt/foodmap/.env`（`chmod 600`），**不在 git 里，部署脚本也不传它**。
 
@@ -60,6 +63,9 @@ curl -s -o /dev/null -w "%{http_code}\n" http://8.134.63.180:3000/discover   # �
 
 # 只有改到 Agent 接入时才需要：本机 frpc + Agent 起着
 curl -s -o /dev/null -w "%{http_code}\n" http://8.134.63.180:3001/.well-known/agent-card.json  # 期望 200
+
+# 内存基线：available 低于 ~600MB 就先查是谁在吃（见 §4.4）
+ssh root@8.134.63.180 "free -m | sed -n '2,3p'"
 ```
 
 若 3001 是 502/000，先在本机跑 `ops\resident.cmd`，别急着部署平台——那会把两个故障混在一起。
@@ -74,7 +80,7 @@ node_modules/.bin/tsc --noEmit -p tsconfig.json
 只有一类错误可以放过：`@prisma/client` 相关的「找不到导出/属性」。原因是本地没跑 `prisma generate`，
 服务器上有生成物，构建不受影响。其他错误一律修掉。
 
-> 不要在本地跑 `next build` 然后把 `.next` 传上去 —— 见 §4 坑 1。
+> 不要在本地跑 `next build` 然后把 `.next` 传上去 —— 见 §5 坑 1。
 
 ### 第 2 步：看差异
 
@@ -85,7 +91,7 @@ SRV_PW='<服务器密码>' python scripts/deploy.py --dry-run
 输出会列出 `M`（改动）/ `A`（新增）/ `D`（服务器有、本地没有）。**先看这份清单**：
 
 - 出现意料之外的文件 → 说明有人在服务器上手工改过代码，先搞清楚改了什么；
-- 出现 `D` → 部署时会被**删除**，见 §4 坑 7；
+- 出现 `D` → 部署时会被**删除**，见 §5 坑 7；
 - 预期 0 改动 → 别部署，说明你的改动没保存或不在 `src/ prisma/ public/ scripts/` 里。
 
 ### 第 3 步：部署
@@ -97,12 +103,20 @@ SRV_PW='<服务器密码>' python scripts/deploy.py
 它做的事，顺序不能变：
 
 1. md5 比对，只传差异文件（实测一次典型改动是 66 个文件里的 3 个）
-2. `systemctl stop foodmap` —— 腾内存
-3. `cp -a .next .next.bak` —— 留退路
-4. `npm run build`（`NODE_OPTIONS=--max-old-space-size=1024`，日志 `/root/build.log`）
-5. 成功 → `systemctl start foodmap`；**失败 → 把 `.next.bak` 换回来并重启旧版本**
+2. **内存预检**：`available + 50MB` 要够 550MB，不够就拒绝构建（`--force` 越过）
+3. `systemctl stop foodmap`，然后**必须看到 `inactive`** 才往下走 —— 停不掉就中止
+4. `cp -a .next .next.bak` —— 留退路
+5. `npm run build`（`NODE_OPTIONS=--max-old-space-size=1024`，全程采样内存峰值，
+   结果写进 `/root/build.log` 的 `MEM_PEAK` 行）
+6. 成功 → `systemctl start foodmap` → **等 `/discover` 真的返回 200**（最多 30 秒）
+7. 构建失败 **或** 起不来 → 把 `.next.bak` 换回来并重启旧版本
 
-**这一步有停机窗口，约 1～2 分钟**（构建本身 60～90 秒 + 启停）。构建期间正在跑的 SSE 长任务会断。
+**停机窗口实测约 30 秒**（构建 16s + 停 1s + 起 + 健康检查 4~10s）。
+这 30 秒里正在跑的 SSE 长任务会断，见 §4.6。
+
+> 关于「停服务腾内存」这句话：**别信**。实测 stop 之后 available 只从 796MB 涨到 849MB，
+> 也就是 50MB 左右。停服是为了拿到 `.next` 的写入权，不是为了让出内存。详见 §4。
+
 
 ### 第 4 步：验证
 
@@ -168,7 +182,142 @@ curl -N -X POST http://8.134.63.180:3000/api/agent/build \
 
 ---
 
-## 4. 坑位清单
+## 4. 停服与内存：1.6G 机器上「停掉」这件事
+
+这台机器卖的是「便宜」，不是「富余」。部署的时候唯一必须停的东西是 `foodmap` 本身，
+但**停错了对象、或者以为停了就能腾出内存**，是这里最容易踩的两个坑。
+
+### 4.1 实测基线（2026-10-29 现场测的，不是估的）
+
+| 指标 | 实测 |
+|---|---|
+| 总内存 / swap | 1608 MB / 4095 MB（`/swapfile`） |
+| 部署前 `available` | 796 MB（`used` 627 / `buff/cache` 891） |
+| `systemctl stop foodmap` 之后 | 849 MB —— **只多出 53 MB** |
+| 构建期间 `MemAvailable` 最低点 | **385 ~ 390 MB**（两次独立实测） |
+| 构建期间 swap 使用 | **0 MB** |
+| 构建耗时 | 16 秒（Next 16 + Turbopack，`cpus: 1`） |
+| 整段停机 | ~30 秒 |
+| `next-server` RSS | 长跑 80 天后 145 MB；刚重启 100 MB |
+
+三条结论，后面所有做法都是从这里推出来的：
+
+1. **停服务不是腾内存的手段。** 只回 50MB。真正的余量来自「少干活」，不是「多停东西」。
+2. **4G swap 不能算进可用内存。** `vm.swappiness = 0`（阿里云镜像默认写死），内核几乎不换出
+   匿名页；实测构建全程 swap 一直是 0。也就是说可用内存掉到 385MB 时，**第二道缓冲并不存在**。
+3. **停机窗口只有 30 秒**，不值得为「缩短窗口」做任何花活；但足够打断在跑的任务。
+
+### 4.2 该停什么，不该停什么
+
+| 对象 | 停不停 | 理由 |
+|---|---|---|
+| `foodmap` | **要停**（脚本自动做） | 不只是腾内存：构建要写 `.next`，正在跑的进程会读到半新半旧的产物，起来以后报各种莫名其妙的错 |
+| `postgresql`（5433） | **别停** | 平台唯一的库（只有 `foodie`），停了平台全挂，而只省下 ~80MB |
+| frps | **别停** | 3001 是 Agent 的唯一回程入口，断了 `/api/agent/*` 全挂。frpc 会自动重连，但重连窗口里 probe 是 502 |
+| `filed_rop-filedrop-1`（docker） | **别顺手停** | 另一个项目的线上服务，占 42MB。真要腾内存才动它，且先跟那个项目确认 |
+| `AliYunDun` / systemd 自身 | 别碰 | 安全组件，停了云控制台会告警 |
+| docker 守护进程本身 | 别停 | `dockerd` + `containerd` 共 ~56MB，停了 `filed_rop` 一起走 |
+
+一句话：**只有 `foodmap` 是你的，别的都是别人的。**
+
+### 4.3 「停」的正确方式
+
+```bash
+systemctl stop foodmap
+echo "STATE=$(systemctl is-active foodmap)"      # 期望 inactive
+echo "PORT=$(ss -lntH 'sport = :3000' | wc -l)"  # 期望 0 ← 这个才是真判据
+```
+
+**判据是「3000 不再监听」，不是「状态叫 inactive」。** 这里有个真实的假象：
+
+> Next 收到 SIGTERM 后以 **143**（128 + 15）退出，systemd 因此把这次 stop 记成
+> `failed (Result: exit-code)`，`systemctl is-active` 输出的是 `failed` 而不是 `inactive`。
+> 这不是停失败，是 unit 没声明「143 算正常退出」。
+
+已经处理过两遍：
+
+- unit 里加了 `SuccessExitStatus=143`（版本化副本在 `scripts/foodmap.service`，
+  服务器上 `/etc/systemd/system/foodmap.service` 就是它）。**换 unit 要 `daemon-reload`。**
+- `deploy.py` 认 `inactive` / `failed` 都算停成功，并且额外验一次 3000 端口 —
+  状态和现实不一致时，以端口为准。
+
+四条不要：
+
+- **不要 `kill <pid>`。** unit 是 `Restart=always` + `RestartSec=3`，杀了它三秒后自己回来。
+  你以为停了，其实内存没腾、构建还撞上它，最后 OOM 时被杀的是谁不好说。
+- **不要 `kill -9`。** Next 需要优雅关闭（正在写的响应不会被硬切）。`systemctl stop`
+  默认给 90 秒优雅期；实测 1 秒内就退了。真卡住了先 `systemctl status foodmap` 看它在等什么。
+- **不要只看 `systemctl start` 的返回就以为好了。** 进程起来 ≠ 能服务。
+  `systemctl is-active` 是绿的但页面 500，是 Next 部署里最常见的「看起来成功了」。
+  所以脚本现在会去 `curl 127.0.0.1:3000/discover` 等到 200，等不到就回滚。
+- **不要用 `systemctl restart` 代替 stop+build+start。** 构建期间服务在跑 = 内存双份占用，
+  而且 `Restart=always` 会在构建中途把服务拉起来读半成品 `.next`。
+
+> **停完就撒手，是这里出过的最严重一次事故**：脚本里「异常时把服务拉起来」的收尾钩子
+> 注册在停服检查**之后**，于是检查失败那条 `sys.exit` 路径直接跳过了钩子，线上真的停了
+> 两分钟。现在钩子注册在 `systemctl stop` 之前，且 `systemctl start` 对已运行的服务是 no-op，
+> 所以任何退出路径（异常、Ctrl-C、Ctrl-Z + kill）都不会把站点留在停着的状态。
+> **手工操作同理**：停之前先想好「谁来把它拉起来」。
+
+### 4.4 内存不够时的处置顺序
+
+按这个顺序，不要跳步：
+
+1. **先看是不是有别的活在跑**：`ps aux --sort=-rss | head -10`、`docker stats --no-stream`
+   —— 最常见的元凶是自己在服务器上开着的 `npm install`、`node`、`vim` 大文件。
+2. **看 swap 到底有没有参与**：`free -m` 第三行、`vmstat 1 5` 的 `si/so`。
+   一直是 0 就说明没有缓冲，别等它救命。
+3. **真要腾**：`docker stop filed_rop-filedrop-1`（-42MB，需另一个项目确认）> 关掉自己的会话
+   > 换机器。把 `NEXT_BUILD_CPUS` 调到 1 已经是默认值了，没有更省的下限。
+4. **`--force` 只在明确知道后果时用**：它跳过预检，构建大概率被 OOM kill，
+   而 OOM 挑谁杀是不可控的。
+
+### 4.5 构建参数不要为了「快」调大
+
+| 参数 | 现值 | 调大的后果 |
+|---|---|---|
+| `NEXT_BUILD_CPUS` | 1 | 2 就会顶穿内存（坑 2 的历史） |
+| `NODE_OPTIONS=--max-old-space-size` | 1024 | 调到 2048 时，Node 会以为有 2G 可以用，实际机器只有 1.6G → 被内核杀，报错还看不出是内存问题 |
+
+在 1.6G 上，「慢」是安全的表现。
+
+### 4.6 停服会打断在跑的 Agent 任务
+
+平台停机的那 30 秒里：
+
+- 浏览器侧的 SSE 连接断掉，`/api/agent/build` 的流直接结束，前端看到的是失败；
+- 本机 Agent **不会**跟着停（它在你的工作站上），pi/python 会继续跑；
+  但它回写平台 API 的请求会在这 30 秒里失败（ECONNREFUSED / 502）。
+  任务 token 是 JWT、验签不依赖进程状态，所以平台回来之后 token 本身仍然有效，
+  不会出现「token 失效」的二次故障。
+
+**做法**：部署前确认没有在跑的建合集任务。查法很土但有效 ——
+看 Agent 日志里最近有没有任务、或者干脆等手上那个跑完再部署。
+不要在用户点完「生成合集」的瞬间部署。
+
+### 4.7 OOM 怎么认
+
+| 现象 | 含义 |
+|---|---|
+| `deploy.py` 报 `EXIT=137` | 137 = 128 + 9(SIGKILL)，**基本就是被 OOM killer 杀的** |
+| `/root/build.log` 最后没有 `EXIT=` 行 | 构建进程在写结果之前就没了 |
+| `MEM_PEAK ... MemAvailable_min=…` 后一行没有 `EXIT=0` | 被杀点就在这个水位 |
+| 别的服务莫名消失（python / dockerd） | 内存不够时内核挑了别人，比构建失败更难查 |
+
+查证据（**重启后窗口内的证据会滚掉，要当场看**）：
+
+```bash
+dmesg -T | grep -i -E 'killed process|out of memory' | tail
+journalctl -k --since '1 hour ago' | grep -i -E 'oom|killed process'
+```
+
+`/var/log/journal` 是持久化的（当前 449MB，`/` 还有 21G，暂时不用清），
+但 `dmesg` 的环形缓冲区会被刷掉。
+
+---
+
+## 5. 坑位清单
+
 
 ### 坑 1｜不要本地构建再上传 `.next`
 
@@ -232,8 +381,16 @@ curl -N -X POST http://8.134.63.180:3000/api/agent/build \
 **做法**：脚本会自动 `mv .next.bak .next` 并重启旧版本。仍然要自己确认：
 
 ```bash
-ssh root@8.134.63.180 "systemctl is-active foodmap; tail -30 /root/build.log"
+ssh root@8.134.63.180 "systemctl is-active foodmap; grep MEM_PEAK /root/build.log; tail -30 /root/build.log"
 ```
+
+两种失败要分开看：
+
+| 日志里的最后一行 | 含义 | 下一步 |
+|---|---|---|
+| `EXIT=137` | 被 OOM killer 杀了（128+9） | 见 §4 / §4.7 |
+| `EXIT=1` 且有 TS / ESLint 输出 | 代码问题 | 修完再部署 |
+| `EXIT=0` 但脚本说「起不来」 | 构建没问题，是运行时起不来 | 看 `journalctl -u foodmap -n 30` |
 
 失败原因绝大多数是：TS 类型错误、`ESLint` 阻断、缺依赖（改了 `package.json` 但没 `npm install`）。
 
@@ -275,8 +432,11 @@ npx prisma migrate resolve --applied 20260806104305_init
 
 ### 坑 9｜内存只有 1.6G，构建时别并发干别的
 
-构建 + 现有服务 + 你另开的重活（比如同时在服务器上跑 `npm install`）会一起进 swap。
-4G swap 是兜底，不是余量。构建期间别在服务器上做别的重操作。
+构建 + 你另开的重活（比如同时在服务器上跑 `npm install`）会抢同一份 1.6G。
+「4G swap 是兜底」这句话在这里**不成立**（`swappiness=0`，实测构建时 swap 用量 0），
+所以别指望它接住。构建期间不要在同一台机器上做重操作。
+
+停服、腾内存、OOM 怎么认，全部展开在 §4，这里不重复。
 
 ---
 
@@ -306,19 +466,21 @@ npx prisma migrate resolve --applied 20260806104305_init
 
 ---
 
-## 5. 回滚
+## 6. 回滚
 
 | 场景 | 做法 |
 |---|---|
-| 构建失败 | 自动回滚，无需操作（确认 `systemctl is-active foodmap`） |
-| 构建成功但功能坏了 | 手工换回上一版产物：`cd /opt/foodmap && systemctl stop foodmap && rm -rf .next && mv .next.bak .next && systemctl start foodmap` |
+| 构建失败（`EXIT≠0`，常见 137=OOM） | 自动回滚，无需操作（确认 `systemctl is-active foodmap`） |
+| 构建成功但服务起不来（脚本已等到 `/discover` 超时） | 自动回滚，同上 |
+| 构建成功、健康检查也过，但功能坏了 | 手工换回上一版产物：`cd /opt/foodmap && systemctl stop foodmap && rm -rf .next && mv .next.bak .next && systemctl start foodmap` |
 | 需要退回更早的代码 | 本地 `git checkout <旧 commit>` → 再跑一次 `deploy.py`（会重新构建） |
 
 注意 `.next.bak` 只保留**上一次**构建前的产物，多次部署后就被覆盖了。
+自动回滚会**消耗** `.next.bak`（它是 `mv` 不是 `cp`），所以回滚完就没有第二份了。
 
 ---
 
-## 6. 手工部署（脚本不可用时）
+## 7. 手工部署（脚本不可用时）
 
 ```bash
 # 1. 本机：传文件（示例：只传改动的几个）
@@ -326,25 +488,35 @@ sftp root@8.134.63.180 <<'EOF'
 put src/lib/agent.ts /opt/foodmap/src/lib/agent.ts
 EOF
 
-# 2. 服务器：备份 + 构建
+# 2. 服务器：看内存 → 备份 → 停服 → 构建 → 起 → 验活
 ssh root@8.134.63.180 '
-  cd /opt/foodmap && systemctl stop foodmap && \
+  free -m | sed -n "2p" && \
+  cd /opt/foodmap && \
   rm -rf .next.bak && cp -a .next .next.bak && \
-  NODE_OPTIONS=--max-old-space-size=1024 npm run build 2>&1 | tail -20 && \
-  systemctl start foodmap && systemctl is-active foodmap'
+  systemctl stop foodmap && systemctl is-active foodmap; \
+  NODE_OPTIONS=--max-old-space-size=1024 npm run build; \
+  systemctl start foodmap; sleep 5; \
+  curl -s -o /dev/null -w "discover=%{http_code}\n" http://127.0.0.1:3000/discover'
 ```
 
-**手工做就少了「只传差异」和「失败自动回滚」，风险更高**，能用脚本就用脚本。
+**手工做就少了「只传差异」「内存预检」「失败自动回滚」，风险更高**，能用脚本就用脚本。
+注意 `systemctl is-active` 在 inactive 时返回码是 3，接在 `&&` 链里会让后面的构建**不执行**
+（上面故意用了 `;` 断开，别改成 `&&`）。
 
 ---
 
-## 7. 上线检查清单
+## 8. 上线检查清单
 
 - [ ] 本地 `tsc --noEmit` 无新增错误
 - [ ] `deploy.py --dry-run` 的差异符合预期，没有意外的 `D`
 - [ ] 新版 `.env` 里的键都写进了 `.env.example`
+- [ ] **没有在跑的建合集任务**（停服 30 秒会打断它，见 §4.6）
+- [ ] 服务器上没有自己开的 `npm install` / 大编译在跑（§4.4）
+- [ ] 部署时脚本打印了「状态 inactive/failed，3000 监听数 0」（§4.3）
+- [ ] 部署日志里的 `MEM_PEAK MemAvailable_min=` 没低到离谱（正常 385~390MB）
+- [ ] `EXIT=0` 而不是 `EXIT=137`
 - [ ] 部署后 `systemctl is-active foodmap` = active
-- [ ] `/discover` 返回 200
+- [ ] `/discover` 返回 200（脚本已自动验，手工部署要自己验）
 - [ ] 新路由出现在 `/root/build.log` 的路由表里
 - [ ] 改了 Agent 接入 → `python scripts/smoke-agent.py --skip-build` 返回 `connected:true`
 - [ ] `python scripts/smoke-agent.py` 退出码 0（`citySource` / `added` / `ownerId` 全过）
