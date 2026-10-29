@@ -353,8 +353,8 @@ export default function AutoBuildPanel() {
         </div>
       )}
 
-      {/* 成功 */}
-      {phase === 'done' && (
+      {/* 成功：必须有 artifact 才算建好了。Agent 正常结束但没产出合集时走下面那个分支 */}
+      {phase === 'done' && artifact && (
         <div className="bg-white rounded-2xl border border-green-200 p-5">
           <p className="font-semibold text-green-700 mb-3">✅ 合集建好了</p>
           <dl className="text-sm space-y-1.5 mb-4">
@@ -431,6 +431,34 @@ export default function AutoBuildPanel() {
                 没拿到合集地址，去「我的合集」里看一眼
               </span>
             )}
+            <Link
+              href="/me"
+              className="px-4 py-2.5 rounded-lg border border-gray-300 text-gray-600 text-sm hover:bg-gray-50"
+            >
+              我的合集
+            </Link>
+          </div>
+        </div>
+      )}
+
+      {/* 跑完了但没产出合集：以前这里会渲染成「✅ 合集建好了」+ 一堆空字段，
+          用户看到的是「成功了但什么都没有」。现在分开说。 */}
+      {phase === 'done' && !artifact && (
+        <div className="bg-white rounded-2xl border border-amber-200 p-5">
+          <p className="font-semibold text-amber-700 mb-2">⚠️ 这次没建成</p>
+          <p className="text-sm text-gray-600 mb-3">
+            Agent 跑完了，但没有产出合集。下面是它的原话：
+          </p>
+          <pre className="text-xs text-gray-700 whitespace-pre-wrap leading-relaxed bg-gray-50 rounded-lg p-3 max-h-72 overflow-auto font-sans">
+            {plain(finalMessage) || '（Agent 没有给出说明）'}
+          </pre>
+          <div className="flex items-center gap-2 mt-4">
+            <Link
+              href="/maps/new"
+              className="flex-1 text-center py-2.5 rounded-lg border border-gray-300 text-gray-700 font-medium hover:bg-gray-50"
+            >
+              改为手动填写
+            </Link>
             <Link
               href="/me"
               className="px-4 py-2.5 rounded-lg border border-gray-300 text-gray-600 text-sm hover:bg-gray-50"

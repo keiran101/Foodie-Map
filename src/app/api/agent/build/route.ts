@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { requireUser } from '@/lib/api-helpers'
@@ -68,10 +69,30 @@ export async function POST(req: NextRequest) {
   if (d.visibility) data.visibility = d.visibility
 
   const encoder = new TextEncoder()
+  // 一次任务打两行结构化日志（开始 / 结束），journalctl 里能直接检索：
+  //   journalctl -u foodmap | grep agent_task
+  // 之前这里是完全静默的：用户报「生成失败了」，服务器上一点痕迹都没有，
+  // 只能去 Agent 那台机器翻 pi 的会话 jsonl 才能还原。
+  const taskId = randomUUID().slice(0, 8)
+  const startedAt = Date.now()
+  console.log(
+    JSON.stringify({
+      evt: 'agent_task_start',
+      taskId,
+      userId: user.id,
+      city: d.city ?? null,
+      visibility: d.visibility ?? null,
+      source: d.source.slice(0, 100),
+    }),
+  )
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let closed = false
+      let finalState = 'stream_open'
+      let artifact = false
+      let added: unknown = null
+      let finalMessage = ''
       const push = (obj: unknown) => {
         if (closed) return
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
@@ -90,11 +111,32 @@ export async function POST(req: NextRequest) {
 
       try {
         for await (const ev of streamBuildTask(cfg, { source: d.source, data }, req.signal)) {
+          if (ev.type === 'artifact') {
+            artifact = true
+            added = (ev.data as Record<string, unknown>).added ?? null
+          } else if (ev.type === 'done') {
+            finalState = ev.state
+            finalMessage = ev.message
+          }
           push(ev)
         }
       } catch (e) {
-        push({ type: 'error', message: e instanceof Error ? e.message : String(e) })
+        finalState = 'throw'
+        finalMessage = e instanceof Error ? e.message : String(e)
+        push({ type: 'error', message: finalMessage })
       } finally {
+        console.log(
+          JSON.stringify({
+            evt: 'agent_task_end',
+            taskId,
+            ms: Date.now() - startedAt,
+            state: finalState,
+            hasArtifact: artifact,
+            added,
+            // 没产出时这段就是唯一线索：Agent 的原话（含它认为的失败原因）
+            message: finalMessage.slice(0, 300),
+          }),
+        )
         closed = true
         clearInterval(heartbeat)
         controller.close()
