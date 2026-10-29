@@ -102,12 +102,20 @@ npm run dev
 | `NEXT_PUBLIC_BASE_URL` | 否 | 生成合集链接时的站点基址 | 空（回退为请求 host） |
 | `JWT_ACCESS_TTL` | 否 | `accessToken` 有效期 | `15m` |
 | `JWT_REFRESH_TTL` | 否 | `refreshToken` 有效期 | `7d` |
+| `JWT_TASK_TTL` | 否 | 下发给 Agent 的任务级 token 有效期（一轮任务可能 10 分钟） | `45m` |
+| `AGENT_A2A_BASE_URL` | 否 | Agent 的 A2A 地址；不配则 `/api/agent/*` 返回 503 | 空 |
+| `AGENT_A2A_TOKEN` | 否 | 与 Agent 侧 `FOODIE_A2A_TOKEN` 一致的静态 Bearer | 空 |
+| `AGENT_STREAM_TIMEOUT_MS` | 否 | 单任务流式上限（毫秒） | `720000`（12 分钟） |
+| `NEXT_BUILD_CPUS` | 否 | 构建并发；1.6G 的服务器上设为 2 会 OOM | `1` |
 
 > 本地数据库示例：`postgresql://foodie:foodie@localhost:5432/foodie`（与 `docker-compose.yml` 中 `foodie-postgres` 容器一致）。
+> `NEXT_PUBLIC_*` 是**构建期内联**的，改了必须重新构建，`restart` 不生效。
 
 ---
 
 ## 🐳 部署
+
+### 本地运行
 
 提供 Docker Compose（PostgreSQL）与统一启动入口：
 
@@ -122,6 +130,18 @@ python main.py
 - **依赖前置**：Node.js、`npm install`、PostgreSQL（16）。
 - **Windows 开机自启**：`scripts/start-foodmap.cmd` 放入用户「启动」文件夹，登录时自动运行 `python main.py`；亦可用 PowerShell 变体 `scripts/start-foodmap.ps1`。
 - **排障**：网页打不开时，先确认 PostgreSQL（5432）在运行，再执行 `python main.py`。
+
+### 上线到云服务器
+
+一键部署（md5 比对增量上传 + 服务端构建 + 失败自动回滚）：
+
+```bash
+SRV_PW='<服务器密码>' python scripts/deploy.py --dry-run   # 先看差异
+SRV_PW='<服务器密码>' python scripts/deploy.py             # 再部署
+```
+
+线上形态、环境变量、以及**不要本地构建再上传 `.next`**、`NEXT_PUBLIC_*` 需重建、
+生产库迁移账本不一致等 12 个坑，见 **[docs/DEPLOY.md](docs/DEPLOY.md)**。
 
 > ⚠️ 当前演示服务（`http://8.134.63.180:3000`）为 **HTTP 明文传输**，请勿在其中存放真实敏感凭证；生产部署请在前端加 HTTPS 反向代理（如 Nginx / Caddy）。
 
