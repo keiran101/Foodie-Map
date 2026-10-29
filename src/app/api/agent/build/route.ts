@@ -1,31 +1,32 @@
-import { randomUUID } from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { requireUser } from '@/lib/api-helpers'
-import { signTaskToken } from '@/lib/auth'
-import { agentConfig, streamBuildTask } from '@/lib/agent'
-import { claimRecentMap } from '@/lib/agent-claim'
+import { agentConfig } from '@/lib/agent'
+import { launchBuildTask } from '@/lib/build-runner'
+import {
+  createBuildTask,
+  findRunningTask,
+  reapStaleTasks,
+  serializeTask,
+} from '@/lib/build-task'
 
 /**
- * 用视频链接 / 店名清单发起一次「建合集」任务，进度与结果以 SSE 推回。
+ * 用视频链接 / 店名清单发起一次「建合集」任务。
  *
- * 为什么是 SSE 而不是普通 POST：一轮要跑 3–10 分钟（取媒体→转写→四层校验→建图），
- * 同步返回会让前端全程黑屏，也容易被反向代理掐断。这里把 Agent 的 A2A 流翻译成
- * 平台自己的事件，前端不需要懂 A2A。
+ * **这里不再是一条 SSE 流，只负责建任务并返回 202。** 执行在 build-runner 里，
+ * 进度与结果写进 BuildTask 表，前端用 GET /api/agent/build/{id} 轮询。
  *
- * 身份：任务以 **当前登录用户** 的名义执行。平台签一个短效任务 token 随任务下发，
- * Agent 用它回写 `/api/collections/generate` —— Agent 不持有任何长期凭据。
+ * 为什么改：任务要跑 3–10 分钟，而旧实现里「任务」就等于「这条 HTTP 连接」。
+ * 用户切到后台被系统丢弃标签页、刷新、点去别的页面、或者 Clash/NAT 掐长连接，
+ * 连接一断状态就永久消失 —— 界面报 network error，而 Agent 在内网工作站上
+ * 照旧跑完、合集已经建好了。连续三次报障都是这个形态。
+ * 断连本该只意味着「少看几帧进度」，不该意味着「这次白做了」。
  *
- * 事件格式（每行一个 data: JSON）：
- *   {type:'progress', state:'working', message:'正在转写 195s'}
- *   {type:'artifact', data:{mapId,mapUrl,city,citySource,added,missing}}
- *   {type:'done', state:'completed'|'failed'|'rejected'|'input-required', message}
- *   {type:'error', message}
+ * 鉴权：任务以当前登录用户的名义执行。平台签一个短效任务 token 随任务下发，
+ * Agent 用它回写 /api/collections/generate —— Agent 不持有任何长期凭据。
  */
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-/** 12 分钟，与 lib/agent.ts 的 STREAM_TIMEOUT_MS 对齐（自建 next start 无平台级硬限） */
-export const maxDuration = 720
 
 const bodySchema = z.object({
   /** 视频链接、店铺清单，或「把这条视频做成合集：<url>」这类自然语言 */
@@ -61,25 +62,33 @@ export async function POST(req: NextRequest) {
   }
 
   const d = parsed.data
-  const data: Record<string, unknown> = {
-    userId: user.id,
-    accessToken: signTaskToken(user),
-  }
-  if (d.city) data.city = d.city
-  if (d.title) data.title = d.title
-  if (d.visibility) data.visibility = d.visibility
 
-  const encoder = new TextEncoder()
-  // 一次任务打两行结构化日志（开始 / 结束），journalctl 里能直接检索：
-  //   journalctl -u foodmap | grep agent_task
-  // 之前这里是完全静默的：用户报「生成失败了」，服务器上一点痕迹都没有，
-  // 只能去 Agent 那台机器翻 pi 的会话 jsonl 才能还原。
-  const taskId = randomUUID().slice(0, 8)
-  const startedAt = Date.now()
+  // 顺手回收进程重启后没人管的任务。做在查询路径上是刻意的：
+  // 这个项目没有常驻调度器，1.6G 的机器上不值得为一个回收器起定时任务。
+  await reapStaleTasks(user.id).catch(() => undefined)
+
+  // 同一用户同时只允许一条：重复点、两个 tab、刷新后重发都落到同一任务上。
+  // 返回 409 而不是静默新建 —— 前端据此直接"接回"那条任务，用户不会白等第二轮。
+  const running = await findRunningTask(user.id)
+  if (running) {
+    return NextResponse.json(
+      { task: serializeTask(running), reused: true },
+      { status: 409, headers: { 'cache-control': 'no-store' } },
+    )
+  }
+
+  const task = await createBuildTask({
+    userId: user.id,
+    source: d.source,
+    city: d.city,
+    title: d.title,
+    visibility: d.visibility,
+  })
+
   console.log(
     JSON.stringify({
       evt: 'agent_task_start',
-      taskId,
+      taskId: task.id,
       userId: user.id,
       city: d.city ?? null,
       visibility: d.visibility ?? null,
@@ -87,155 +96,11 @@ export async function POST(req: NextRequest) {
     }),
   )
 
-  // closed / heartbeat 必须放在 start() 外面：cancel() 是 ReadableStream 的回调，
-  // 拿不到 start() 里的局部变量。之前它们定义在 start() 内部，客户端一断开就没人清理，
-  // 后续每次 push 都会撞上已关闭的 controller（"Invalid state: Controller is already closed"），
-  // 而 catch 里那次 push 会把异常二次抛出、从 start() 泄漏出去，浏览器看到的就是 network error。
-  let closed = false
-  let heartbeat: ReturnType<typeof setInterval> | null = null
-  /** 客户端走了（关页面 / 刷新 / 切走 / 网络断）。任务不因此中止，只停止写响应。 */
-  let clientGone = false
+  // 不 await：执行跑在请求之外，浏览器随时可以走
+  launchBuildTask(task.id)
 
-  const stopWriting = () => {
-    closed = true
-    if (heartbeat) {
-      clearInterval(heartbeat)
-      heartbeat = null
-    }
-  }
-
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let finalState = 'stream_open'
-      let artifact = false
-      let added: unknown = null
-      let finalMessage = ''
-      let recovered: string | null = null
-
-      const push = (obj: unknown) => {
-        if (closed) return
-        try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
-        } catch {
-          // 客户端已经走了：从这里开始不再写，但任务本身要继续跑完并入库。
-          clientGone = true
-          stopWriting()
-        }
-      }
-
-      // 心跳：一轮任务里可能有 60s 以上没有任何事件（比如在转写）。
-      // 长时间静默的连接会被 NAT / 中间层当成死连接掐掉，前端看到的是「突然断了」。
-      // 用 SSE 注释帧（以 `:` 开头）保活，客户端的解析器会直接忽略它。
-      heartbeat = setInterval(() => {
-        if (closed) return
-        try {
-          controller.enqueue(encoder.encode(': ping\n\n'))
-        } catch {
-          clientGone = true
-          stopWriting()
-        }
-      }, 15_000)
-
-      try {
-        for await (const ev of streamBuildTask(cfg, { source: d.source, data }, req.signal)) {
-          if (ev.type === 'artifact') {
-            artifact = true
-            added = (ev.data as Record<string, unknown>).added ?? null
-          } else if (ev.type === 'done') {
-            finalState = ev.state
-            finalMessage = ev.message
-          } else if (ev.type === 'error') {
-            // 漏了这分支的话，日志里状态会永远停在 stream_open，看不出断在哪
-            finalState = ev.mayHaveProgress ? 'stream_error_mid' : 'stream_error'
-            finalMessage = ev.message
-          }
-          push(ev)
-        }
-      } catch (e) {
-        finalState = 'throw'
-        finalMessage = e instanceof Error ? e.message : String(e)
-        push({ type: 'error', message: finalMessage })
-      } finally {
-        stopWriting()
-        // 断流兜底：没拿到 artifact、且终态不是「Agent 明确给出结论」的那几种时，
-        // 用「任务开始之后、属于本用户新建的合集」把产物认领回来。
-        // 判据是 createdAt >= 任务开始时间——硬约束，不依赖 Agent 回报，
-        // 也不是"多久之内算相关"那种启发式。
-        //
-        // 为什么必须有这一步：实测过两次（17:50、19:24），前端显示失败，
-        // 数据库里其实已经躺着一个建好的合集。用户以为白等了，答案就在「我的合集」里。
-        const concluded =
-          finalState === 'completed' ||
-          finalState === 'rejected' ||
-          finalState === 'input-required' ||
-          finalState === 'canceled'
-        if (!artifact && !concluded) {
-          try {
-            const claimed = await claimRecentMap(user.id, startedAt)
-            if (claimed) {
-              artifact = true
-              added = claimed.added
-              recovered = claimed.mapId
-              finalState = 'recovered'
-              finalMessage = `平台没收到 Agent 的回复，但它在断流之后仍然建好了：${claimed.title}`
-              push({
-                type: 'artifact',
-                data: {
-                  mapId: claimed.mapId,
-                  city: claimed.city,
-                  visibility: claimed.visibility,
-                  added: claimed.added,
-                  recovered: true,
-                },
-              })
-              push({ type: 'done', state: 'completed', message: finalMessage })
-            }
-          } catch (e) {
-            // 查库失败不能把流卡死，前端还有「去我的合集看」的提示兜着
-            console.error(
-              JSON.stringify({ evt: 'agent_task_recover_failed', taskId, error: String(e).slice(0, 200) }),
-            )
-          }
-        }
-        if (clientGone && !recovered) finalState = 'client_gone'
-        console.log(
-          JSON.stringify({
-            evt: 'agent_task_end',
-            taskId,
-            ms: Date.now() - startedAt,
-            state: finalState,
-            hasArtifact: artifact,
-            added,
-            // 认领成功但前端已经断了：这条是唯一能对上号的线索，用户报时间就能查
-            recovered,
-            clientGone,
-            // 没产出时这段就是唯一线索：Agent 的原话（含它认为的失败原因）
-            message: finalMessage.slice(0, 300),
-          }),
-        )
-        try {
-          controller.close()
-        } catch {
-          // 已经因为取消/错误关掉了
-        }
-      }
-    },
-    cancel() {
-      // 客户端断开（关页面 / 刷新 / 切走 / 网络闪断）。
-      // 不中止 Agent 任务：它已经跑起来了，让它跑完并入库，比半路杀掉更有用——
-      // finally 的认领逻辑靠的就是这个。req.signal 会自己掐断我们和 Agent 之间的流。
-      clientGone = true
-      stopWriting()
-    },
-  })
-
-  return new Response(stream, {
-    headers: {
-      'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache, no-transform',
-      connection: 'keep-alive',
-      // 关掉 nginx/反代的缓冲，否则进度会被憋到任务结束才一次性到达
-      'x-accel-buffering': 'no',
-    },
-  })
+  return NextResponse.json(
+    { task: serializeTask(task) },
+    { status: 202, headers: { 'cache-control': 'no-store' } },
+  )
 }

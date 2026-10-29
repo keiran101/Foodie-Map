@@ -69,6 +69,9 @@ rm -f /tmp/mempeak.log
     sleep 1
   done ) &
 SAM=$!
+# schema.prisma 变了必须先重新生成 client：否则 next build 的类型检查会直接失败
+# （新的 model 在 @prisma/client 上不存在）。generate 很轻，不占多少内存。
+npx prisma generate >> /root/build.log 2>&1 || echo "PRISMA_GENERATE_FAIL" >> /root/build.log
 NODE_OPTIONS=--max-old-space-size=1024 npm run build >> /root/build.log 2>&1
 C=$?
 kill "$SAM" 2>/dev/null
@@ -180,6 +183,22 @@ def main():
         srv.run(f"rm -f {posixpath.join(REMOTE, rel)}", check=False)
     if removed:
         print(f"已删除 {len(removed)} 个文件")
+
+    # ---- schema 变更 → 推库 ----
+    # 生产库是 db push 建的（见 docs/DEPLOY.md 坑 8），这里沿用同一套，别混进 migrate。
+    # 只在真的上传了新的 schema.prisma 时才做；刻意**不加 --accept-data-loss**：
+    # 万一遇到会删列/删表的变更，宁可在这一步失败、把线上留在旧版本上，
+    # 也不要让一个部署脚本替人决定丢掉生产数据。
+    if "prisma/schema.prisma" in changed:
+        print("schema.prisma 有变更 → prisma db push")
+        out, err, rc = srv.run(
+            f"cd {REMOTE} && npx prisma db push --skip-generate", timeout=300, check=False
+        )
+        for line in (out or err).strip().splitlines()[-6:]:
+            print("  " + line)
+        if rc != 0:
+            srv.c.close()
+            sys.exit("db push 失败，已中止部署（服务仍在旧版本上，未被改动）。")
 
     # ---- 内存预检 ----
     # 这台机器 1608MB，构建要多占 ~460MB。停服务只腾出 ~50MB —— 别指望用「停服」换内存。

@@ -87,101 +87,34 @@ export async function api(path: string, opts: { method?: string; body?: unknown 
   }
   const data = await res.json().catch(() => null)
   if (!res.ok) {
-    const err = new Error((data && data.error) || ('请求失败 ' + res.status))
-    ;(err as any).status = res.status
+    const err = new Error((data && data.error) || ('请求失败 ' + res.status)) as ApiError
+    err.status = res.status
+    // 把原始响应体挂上：有些非 2xx 是**有意义的正常分支**，不是错误。
+    // 例如建任务返回 409 = 「你已经有一条在跑」，调用方需要里面的 task 去接回它。
+    err.data = data
     throw err
   }
   return data
 }
 
-/** SSE 事件（与服务端 /api/agent/build 写出的事件一一对应） */
-export interface StreamEvent {
-  type: 'progress' | 'artifact' | 'done' | 'error'
-  state?: string
-  message?: string
-  data?: Record<string, unknown>
+/** `api()` 抛出的错误：带 HTTP 状态码与原始响应体，调用方能按状态码分派 */
+export interface ApiError extends Error {
+  status?: number
+  data?: { error?: string; detail?: string; task?: unknown } | null
 }
+
 
 /**
- * POST 一个 SSE 接口并把每条事件回调出去。
+ * 这里曾经有一个 `streamApi()`：用 fetch 读 body 流，把 /api/agent/build 的 SSE
+ * 事件逐条回调出去。它被删掉的原因是那个方案本身错了，不是实现错了 ——
  *
- * 为什么不用 `EventSource`：它不能带 `Authorization` 头，而本项目所有鉴权都是 Bearer。
- * 所以用 fetch 读 body 流、自己按 `\n\n` 切帧 —— 帧格式与服务端写的是同一套。
+ * 当时「一次任务」就等于「这一条长连接」：用户切到后台被系统丢弃标签页、刷新、
+ * 点去别的页面、或者 Clash/NAT 把长连接掐掉，连接一断任务状态就永久消失。
+ * 界面报 network error，可 Agent 在内网工作站上照旧跑完、合集早就建好了。
+ * 连续三次报障都是这个形态。
  *
- * 401 的处置和 `api()` 一致：先 refresh 再重放一次。任务要跑 3–10 分钟，
- * 期间 token 到期很常见，不重放的话用户看到的是「生成失败」，其实是登录过期。
- *
- * 以 `:` 开头的心跳帧会被忽略（服务端每 15s 发一次，防止长静默被中间层掐断）。
+ * 现在任务在服务端（BuildTask 表），前端用 `api()` 每 2 秒轮询一次快照。
+ * 短请求不会被当成死连接，切后台/刷新/换设备全部天然免疫。
+ * 别再为了「实时一点」把长连接加回来 —— 那 2 秒延迟买不到任何东西。
  */
-export async function streamApi(
-  path: string,
-  body: unknown,
-  onEvent: (ev: StreamEvent) => void,
-  opts: { signal?: AbortSignal; onOpen?: () => void } = {},
-): Promise<void> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    accept: 'text/event-stream',
-  }
-  const token = getToken()
-  if (token) headers['Authorization'] = 'Bearer ' + token
-
-  const send = () =>
-    fetch(path, { method: 'POST', headers, body: JSON.stringify(body), signal: opts.signal })
-
-  let res = await send()
-  if (res.status === 401 && token) {
-    const ok = await tryRefresh()
-    if (ok) {
-      const fresh = getToken()
-      if (fresh) headers['Authorization'] = 'Bearer ' + fresh
-      res = await send()
-    }
-  }
-
-  if (!res.ok || !res.body) {
-    const data = await res.json().catch(() => null)
-    const msg =
-      data && data.error
-        ? data.detail
-          ? `${data.error}：${data.detail}`
-          : data.error
-        : '请求失败 ' + res.status
-    const err = new Error(msg)
-    ;(err as any).status = res.status
-    throw err
-  }
-
-  opts.onOpen?.()
-
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-
-      let idx: number
-      while ((idx = buf.indexOf('\n\n')) >= 0) {
-        const frame = buf.slice(0, idx)
-        buf = buf.slice(idx + 2)
-        const payload = frame
-          .split('\n')
-          .filter((l) => l.startsWith('data:'))
-          .map((l) => l.slice(5).trim())
-          .join('')
-        if (!payload) continue // `: ping` 心跳
-        try {
-          onEvent(JSON.parse(payload) as StreamEvent)
-        } catch {
-          // 坏帧不打断整条流：宁可少一条进度，也不要整轮任务作废
-        }
-      }
-    }
-  } finally {
-    reader.cancel().catch(() => {})
-  }
-}
 

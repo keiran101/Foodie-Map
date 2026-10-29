@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import Link from 'next/link'
-import { api, streamApi } from '@/lib/client-api'
+import { api } from '@/lib/client-api'
 import { useAuth } from './auth-context'
 
 /**
@@ -12,20 +12,37 @@ import { useAuth } from './auth-context'
  * 由它取视频文案 → 找店 → 补坐标 → 建图，3–10 分钟。所以这一屏的主要职责是
  * 「让人觉得它在动」：实时进度、已用时间、可中断、最后给出可核对的产出。
  *
+ * **状态不在这个组件里，在服务端的 BuildTask 表里。** 这是刻意的：
+ * 一轮任务要跑好几分钟，期间用户会切后台、刷新、点去别的页面、换设备。
+ * 旧实现把任务等同于一条 SSE 连接，连接一断状态就永久消失；而 Agent 在内网
+ * 工作站上照旧跑完、合集已经建好。现在进页面先问一句「我有任务在跑吗」，
+ * 有就接着显示 —— 断连只意味着少看几帧进度。
+ *
  * 三个刻意的取舍：
  * 1. 默认可见性 UNLISTED —— AI 生成的合集先不推上首页，自己看过再改公开。
  * 2. 城市来源要显示出来（citySource）。平台指定 vs Agent 推断，决定了用户要不要复核。
  * 3. 中断要说实话：断开只是停掉这条流，Agent 侧的子进程不保证随之回收。
  */
 
-type Phase = 'idle' | 'running' | 'done' | 'failed'
-
-interface Step {
-  t: number
-  message: string
-  /** 连续重复出现的次数。Agent 的工具进度会把同一句话重复好几遍，逐条列出很难看 */
-  n: number
+/** 与 app/api/agent/build 的 serializeTask 对齐 */
+interface TaskView {
+  id: string
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELED' | 'STALE'
+  source: string
+  city: string | null
+  title: string | null
+  visibility: string
+  progress: string | null
+  steps: { t: number; message: string }[]
+  result: Record<string, unknown> | null
+  mapId: string | null
+  message: string | null
+  error: string | null
+  createdAt: string
+  elapsedMs: number
 }
+
+type Phase = 'idle' | 'running' | 'done' | 'failed'
 
 const VISIBILITY_OPTIONS = [
   { value: 'UNLISTED', label: '不列出（有链接可看）' },
@@ -34,6 +51,11 @@ const VISIBILITY_OPTIONS = [
 ]
 
 const EXAMPLE = '把这两家店做成合集：深圳福田区八卦一路的豪先生、深圳南山区海岸城的海底捞'
+
+/** 轮询间隔。一轮任务的事件本来就稀疏，2 秒的延迟在体感上没有区别 */
+const POLL_MS = 2000
+/** 查询失败时的退避：别在网络抖动时把请求打满 */
+const POLL_BACKOFF_MS = 5000
 
 export default function AutoBuildPanel() {
   const { user, loading: authLoading } = useAuth()
@@ -45,26 +67,19 @@ export default function AutoBuildPanel() {
   const [advanced, setAdvanced] = useState(false)
 
   const [phase, setPhase] = useState<Phase>('idle')
-  const [steps, setSteps] = useState<Step[]>([])
-  const [artifact, setArtifact] = useState<Record<string, unknown> | null>(null)
+  const [task, setTask] = useState<TaskView | null>(null)
   const [error, setError] = useState('')
-  /**
-   * 「连接断了，但 Agent 那边可能已经建完」。
-   *
-   * 这个状态必须单独记：平台只是没收到结果，Agent 的任务照跑。实测过一次
-   * 8 分钟的任务——前端显示失败，数据库里其实已经躺着一个 8 家店的合集。
-   * 只报「失败」会让用户以为白等了，实际答案在「我的合集」里。
-   */
-  const [maybeDone, setMaybeDone] = useState(false)
-  const [endState, setEndState] = useState('')
-  const [finalMessage, setFinalMessage] = useState('')
   const [elapsed, setElapsed] = useState(0)
+  /** 这条任务是「进页面时接回来的」，不是这一次刚发起的 */
+  const [resumed, setResumed] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
 
-  const [probe, setProbe] = useState<'idle' | 'checking' | 'ready' | 'offline' | 'unreachable'>('idle')
+  // 初值就是「检查中」：在 effect 里同步 setState 会触发级联渲染（react-hooks 会报错），
+  // 而且这里确实没什么要重置的 —— 探针结果不随登录状态反复变化。
+  const [probe, setProbe] = useState<'checking' | 'ready' | 'offline' | 'unreachable'>('checking')
 
-  const abortRef = useRef<AbortController | null>(null)
   const pollRef = useRef<number | null>(null)
-  const startedAt = useRef(0)
+  const aliveRef = useRef(true)
 
   function stopPolling() {
     if (pollRef.current !== null) {
@@ -73,42 +88,56 @@ export default function AutoBuildPanel() {
     }
   }
 
-  /**
-   * 连接断了之后自救：断的只是平台↔Agent 那条 HTTP 流，Agent 的任务没停，
-   * 产物通常几十秒后才入库（实测 19:24 那次：平台 24s 报错，Agent 36s 建完）。
-   * 每 15 秒问一次「任务开始之后有没有新合集」，最多 8 次（约 2 分钟）。
-   *
-   * 判据和服务端断流兜底完全一致（ownerId + createdAt >= 任务开始时刻），
-   * 前端不做任何推断，只是把同一条硬约束用在浏览器侧。
-   */
-  function pollForResult(since: number) {
+  /** 把服务端快照映射成本地视图。只有这里决定 phase，别处不猜。 */
+  function applyTask(t: TaskView) {
+    setTask(t)
+    if (t.status === 'RUNNING') {
+      setPhase('running')
+      setError('')
+    } else if (t.status === 'COMPLETED') {
+      setPhase('done')
+      setError('')
+    } else if (t.status === 'CANCELED') {
+      setPhase('failed')
+      setError(t.error || '已中断。')
+    } else {
+      setPhase('failed')
+      setError(t.error || t.message || '这轮任务没有完成。')
+    }
+  }
+
+  /** 一次查询 + 安排下一次。终态就停，任务到点就自然结束轮询。 */
+  function poll(id: string) {
     stopPolling()
-    let tries = 0
     const tick = async () => {
       pollRef.current = null
-      tries += 1
+      if (!aliveRef.current) return
       try {
-        const d = await api(`/api/agent/recent?since=${since}`)
-        if (d?.found && d.map) {
-          setArtifact({ ...d.map, recovered: true })
-          setPhase('done')
-          setError('')
-          setMaybeDone(false)
+        const d = await api(`/api/agent/build/${id}`)
+        if (!aliveRef.current) return
+        applyTask(d.task as TaskView)
+        if (d.task.status === 'RUNNING') {
+          pollRef.current = window.setTimeout(tick, POLL_MS)
+        }
+      } catch (e) {
+        if (!aliveRef.current) return
+        const err = e as Error & { status?: number }
+        // 404 = 任务被删了；401 已由 api() 处理过刷新。其余一律退避重试，
+        // 因为一次查询失败不代表任务失败 —— 状态还在库里。
+        if (err.status === 404) {
+          setPhase('failed')
+          setError('找不到这条任务了（可能已被清理）。去「我的合集」看看有没有结果。')
           return
         }
-      } catch {
-        // 查不到就静默再等一轮，别再给用户叠一层报错
+        pollRef.current = window.setTimeout(tick, POLL_BACKOFF_MS)
       }
-      if (tries < 8) pollRef.current = window.setTimeout(tick, 15_000)
     }
-    // 先等 8 秒：断流时 Agent 往往刚好在建图，立刻查会扑空
-    pollRef.current = window.setTimeout(tick, 8_000)
+    pollRef.current = window.setTimeout(tick, 300)
   }
 
   // 探针：先说清楚「Agent 通不通」，别让用户贴上内容等十分钟才发现没接上
   useEffect(() => {
     if (!user) return
-    setProbe('checking')
     api('/api/agent/probe')
       .then((d) => {
         if (!d.configured) setProbe('offline')
@@ -117,131 +146,150 @@ export default function AutoBuildPanel() {
       .catch(() => setProbe('unreachable'))
   }, [user])
 
+  /**
+   * 进页面第一件事：问「我有任务在跑吗」。
+   *
+   * 这一句就是「退出界面再进来不丢状态」的全部实现。不用 localStorage 存 taskId：
+   * 那只能救同一个浏览器，救不了换设备、清缓存、或者"我忘了是哪个 tab 发的"。
+   * 身份的真相在登录态里。
+   */
+  useEffect(() => {
+    if (!user) return
+    aliveRef.current = true
+    let cancelled = false
+    api('/api/agent/build/active')
+      .then((d) => {
+        if (cancelled || !aliveRef.current) return
+        const t = d?.task as TaskView | null
+        if (!t) return
+        applyTask(t)
+        // 只有还在跑才需要接回轮询；已结束的直接把结果摆出来就够
+        if (t.status === 'RUNNING') {
+          setResumed(true)
+          poll(t.id)
+        }
+      })
+      .catch(() => {
+        // 接不回来不该拦住用户发新任务，静默失败
+      })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user])
+
   // 已用时间：任务大部分时间没有新事件，没有这个计时器页面看起来像卡死了
   useEffect(() => {
-    if (phase !== 'running') return
-    const id = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt.current) / 1000)), 1000)
+    if (phase !== 'running' || !task) return
+    const base = new Date(task.createdAt).getTime()
+    const tick = () => setElapsed(Math.floor((Date.now() - base) / 1000))
+    tick()
+    const id = setInterval(tick, 1000)
     return () => clearInterval(id)
-  }, [phase])
+  }, [phase, task])
 
-  // 离开页面就断开流（Agent 侧不受影响，见文件头第 3 条）
+  /**
+   * 离开页面：只停掉**本地的轮询定时器**，不动服务端的任务。
+   *
+   * 关键差别就在这里 —— 旧实现在这里 abort 掉 fetch，而那条 fetch 就是任务本身，
+   * 于是「点去别的页面看一眼」等于把状态扔掉。
+   */
   useEffect(
     () => () => {
-      abortRef.current?.abort()
-      if (pollRef.current !== null) window.clearTimeout(pollRef.current)
+      aliveRef.current = false
+      stopPolling()
     },
     [],
   )
 
+  // 连续相同的进度合并成一条 ×n：Agent 的工具会把同一句话重复好几遍，逐条列出很难看
+  const mergedSteps = useMemo(() => {
+    const out: { t: number; message: string; n: number }[] = []
+    for (const s of task?.steps ?? []) {
+      const last = out[out.length - 1]
+      if (last && last.message === s.message) last.n += 1
+      else out.push({ t: s.t, message: s.message, n: 1 })
+    }
+    return out
+  }, [task])
+
+  const artifact = task?.result ?? null
+
   const mapHref = useMemo(() => {
-    if (!artifact) return ''
-    if (typeof artifact.mapId === 'string' && artifact.mapId) return '/maps/' + artifact.mapId
-    const url = (artifact.mapUrl || artifact.url) as string | undefined
+    const mapId = (artifact?.mapId as string | undefined) || task?.mapId
+    if (mapId) return '/maps/' + mapId
+    const url = (artifact?.mapUrl || artifact?.url) as string | undefined
     const m = url ? /\/maps\/([A-Za-z0-9_-]+)/.exec(url) : null
     return m ? '/maps/' + m[1] : ''
-  }, [artifact])
+  }, [artifact, task])
 
   // artifact 不一定回传 visibility，那就回落到「用户选的」，并在 UI 上标明来源不同
-  const shownVisibility = ((artifact?.visibility as string | undefined) || visibility)
+  const shownVisibility = (artifact?.visibility as string | undefined) || task?.visibility || visibility
 
   function reset() {
     stopPolling()
     setPhase('idle')
-    setSteps([])
-    setArtifact(null)
+    setTask(null)
     setError('')
-    setMaybeDone(false)
-    setEndState('')
-    setFinalMessage('')
     setElapsed(0)
+    setResumed(false)
+    setSource('')
+    setTitle('')
+    setCity('')
   }
 
   async function start() {
     const src = source.trim()
     if (!src) {
       setError('先贴一条视频链接，或者写一句要做什么')
+      setPhase('failed')
       return
     }
     stopPolling()
-    setPhase('running')
-    setSteps([])
-    setArtifact(null)
+    setSubmitting(true)
     setError('')
-    setMaybeDone(false)
-    setEndState('')
-    setFinalMessage('')
+    setResumed(false)
+    setTask(null)
     setElapsed(0)
-    startedAt.current = Date.now()
-
-    const ctl = new AbortController()
-    abortRef.current = ctl
-    let settled = false
 
     try {
-      await streamApi(
-        '/api/agent/build',
-        {
+      const d = await api('/api/agent/build', {
+        method: 'POST',
+        body: {
           source: src,
           city: city.trim() || undefined,
           title: title.trim() || undefined,
           visibility,
         },
-        (ev) => {
-          if (ev.type === 'progress') {
-            const t = Math.floor((Date.now() - startedAt.current) / 1000)
-            const msg = ev.message || ''
-            setSteps((s) => {
-              const last = s[s.length - 1]
-              // 连续相同的进度合并成一条 ×n：工具会连发「正在执行 X」「X 完成」多遍
-              if (last && last.message === msg) return [...s.slice(0, -1), { ...last, n: last.n + 1 }]
-              return [...s, { t, message: msg, n: 1 }]
-            })
-          } else if (ev.type === 'artifact') {
-            setArtifact(ev.data ?? null)
-          } else if (ev.type === 'error') {
-            settled = true
-            setPhase('failed')
-            setMaybeDone(Boolean((ev as { mayHaveProgress?: boolean }).mayHaveProgress))
-            setError(ev.message || '出错了')
-          } else if (ev.type === 'done') {
-            settled = true
-            setEndState(ev.state || '')
-            setFinalMessage(ev.message || '')
-            if (ev.state === 'completed') {
-              setPhase('done')
-            } else {
-              setPhase('failed')
-              setError(ev.message || '任务没有完成（' + (ev.state || '未知状态') + '）')
-            }
-          }
-        },
-        { signal: ctl.signal, onOpen: () => setProbe('ready') },
-      )
-      if (!settled) {
-        setPhase('failed')
-        // 流结束了却没终态：一律按「可能已建完」处理，见 maybeDone 的注释
-        setMaybeDone(true)
-        setError('连接结束了，但没收到最终结果')
-        pollForResult(startedAt.current)
-      }
+      })
+      applyTask(d.task as TaskView)
+      poll(d.task.id)
     } catch (e) {
-      const err = e as Error & { name?: string }
-      setPhase('failed')
-      if (err?.name === 'AbortError') {
-        setMaybeDone(true)
-        setError('已中断。注意：Agent 那边的任务不会跟着停，仍可能建出合集。')
-        pollForResult(startedAt.current)
-      } else if (isNetworkError(err)) {
-        // fetch 层失败：连接被掐、断网、或响应流被服务端异常终止。
-        // 这不等于 Agent 没收到任务——实测两次都是"界面报错、后台已经建好了"。
-        setMaybeDone(true)
-        setError('和平台的连接断了')
-        pollForResult(startedAt.current)
+      const err = e as Error & { status?: number; data?: { task?: TaskView } }
+      // 409 = 已经有一条在跑（重复点、两个 tab、刷新后重发）。直接接回那条，
+      // 而不是再起一轮 —— 2 个并发任务在这台 1.6G 的机器上没有必要，Agent 那边也串行。
+      if (err.status === 409 && err.data?.task) {
+        applyTask(err.data.task)
+        setResumed(true)
+        poll(err.data.task.id)
       } else {
+        setPhase('failed')
         setError(err?.message || '发起失败')
       }
     } finally {
-      abortRef.current = null
+      setSubmitting(false)
+    }
+  }
+
+  async function cancel() {
+    if (!task) return
+    stopPolling()
+    try {
+      const d = await api(`/api/agent/build/${task.id}/cancel`, { method: 'POST' })
+      applyTask(d.task as TaskView)
+    } catch (e) {
+      setPhase('failed')
+      setError((e as Error)?.message || '中断失败')
     }
   }
 
@@ -277,6 +325,13 @@ export default function AutoBuildPanel() {
         </div>
       )}
 
+      {/* 接回任务时说明一句：用户可能已经在别的页面/设备上离开了很久 */}
+      {resumed && running && (
+        <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+          这条任务还在跑，已经接着上次的进度显示。离开这个页面不会中断它。
+        </div>
+      )}
+
       <div className="bg-white rounded-2xl border border-gray-200 p-6 space-y-4">
         <div>
           <label className="block text-sm font-medium mb-1">贴链接，或者直接说</label>
@@ -284,7 +339,7 @@ export default function AutoBuildPanel() {
             value={source}
             onChange={(e) => setSource(e.target.value)}
             rows={4}
-            disabled={running}
+            disabled={running || submitting}
             maxLength={2000}
             placeholder={'· 一条探店视频链接：https://v.douyin.com/xxxxxxx/\n· 或者一句清单：把深圳这两家店做成合集：八卦一路的豪先生、海岸城的海底捞'}
             className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-gray-50"
@@ -293,7 +348,7 @@ export default function AutoBuildPanel() {
             <button
               type="button"
               onClick={() => setSource(EXAMPLE)}
-              disabled={running}
+              disabled={running || submitting}
               className="text-xs text-orange-600 hover:underline disabled:opacity-50"
             >
               用个示例试试
@@ -317,7 +372,7 @@ export default function AutoBuildPanel() {
                 <input
                   value={city}
                   onChange={(e) => setCity(e.target.value)}
-                  disabled={running}
+                  disabled={running || submitting}
                   placeholder="例如：深圳"
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-gray-50"
                 />
@@ -327,7 +382,7 @@ export default function AutoBuildPanel() {
                 <input
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
-                  disabled={running}
+                  disabled={running || submitting}
                   placeholder="例如：福田十月的五家小店"
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-gray-50"
                 />
@@ -337,7 +392,7 @@ export default function AutoBuildPanel() {
                 <select
                   value={visibility}
                   onChange={(e) => setVisibility(e.target.value)}
-                  disabled={running}
+                  disabled={running || submitting}
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white disabled:bg-gray-50"
                 >
                   {VISIBILITY_OPTIONS.map((o) => (
@@ -355,19 +410,19 @@ export default function AutoBuildPanel() {
         </div>
 
         <div className="flex items-center gap-3">
-          {phase === 'idle' && (
+          {(phase === 'idle' || (phase === 'failed' && !task)) && (
             <button
               onClick={start}
-              disabled={blocked}
+              disabled={blocked || submitting}
               className="flex-1 py-2.5 rounded-lg bg-orange-500 text-white font-medium hover:bg-orange-600 disabled:opacity-50"
             >
-              开始生成
+              {submitting ? '正在提交…' : '开始生成'}
             </button>
           )}
           {running && (
             <>
               <button
-                onClick={() => abortRef.current?.abort()}
+                onClick={cancel}
                 className="px-4 py-2.5 rounded-lg border border-gray-300 text-gray-600 text-sm hover:bg-gray-50"
               >
                 中断
@@ -378,7 +433,7 @@ export default function AutoBuildPanel() {
               </div>
             </>
           )}
-          {(phase === 'done' || phase === 'failed') && (
+          {(phase === 'done' || (phase === 'failed' && task)) && (
             <button
               onClick={reset}
               className="flex-1 py-2.5 rounded-lg border border-gray-300 text-gray-700 font-medium hover:bg-gray-50"
@@ -390,26 +445,26 @@ export default function AutoBuildPanel() {
 
         {phase === 'idle' && (
           <p className="text-[11px] text-gray-400">
-            一轮通常 1–5 分钟，取决于视频长度。生成期间请留在这个页面，关掉会断掉进度（任务本身仍在跑）。
+            一轮通常 1–5 分钟，取决于视频长度。
+            <strong className="font-medium text-gray-500">生成期间可以关掉这个页面</strong>
+            ：任务在服务端跑，回来还能接着看进度和结果。
           </p>
         )}
       </div>
 
       {/* 进度：只显示收到的，不编造阶段 */}
-      {steps.length > 0 && (
+      {mergedSteps.length > 0 && (
         <div className="bg-white rounded-2xl border border-gray-200 p-5">
           <p className="text-sm font-medium mb-3">进度</p>
           <ol className="space-y-2">
-            {steps.map((s, i) => (
+            {mergedSteps.map((s, i) => (
               <li key={i} className="flex gap-3 text-sm">
                 <span className="text-[11px] text-gray-400 tabular-nums w-10 shrink-0 pt-0.5">
                   {fmt(s.t)}
                 </span>
                 <span className="text-gray-700 leading-snug">
                   {s.message}
-                  {s.n > 1 && (
-                    <span className="ml-1.5 text-[11px] text-gray-400">×{s.n}</span>
-                  )}
+                  {s.n > 1 && <span className="ml-1.5 text-[11px] text-gray-400">×{s.n}</span>}
                 </span>
               </li>
             ))}
@@ -423,7 +478,7 @@ export default function AutoBuildPanel() {
         </div>
       )}
 
-      {/* 成功：必须有 artifact 才算建好了。Agent 正常结束但没产出合集时走下面那个分支 */}
+      {/* 成功：必须有产出才算建好了。Agent 正常结束但没产出合集时走下面那个分支 */}
       {phase === 'done' && artifact && (
         <div className="bg-white rounded-2xl border border-green-200 p-5">
           <p className="font-semibold text-green-700 mb-3">
@@ -435,40 +490,36 @@ export default function AutoBuildPanel() {
             )}
           </p>
           <dl className="text-sm space-y-1.5 mb-4">
-            {typeof artifact?.title === 'string' && artifact.title && (
+            {typeof artifact.title === 'string' && artifact.title && (
               <Row label="标题" value={artifact.title as string} />
             )}
-            {typeof artifact?.city === 'string' && artifact.city && (
+            {typeof artifact.city === 'string' && artifact.city && (
               <Row
                 label="城市"
                 value={
-                  artifact.citySource === 'inferred' ? (
-                    <span>
-                      {artifact.city as string}
+                  <span>
+                    {artifact.city as string}
+                    {artifact.citySource === 'inferred' && (
                       <span className="ml-2 px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 text-[11px]">
                         由 Agent 推断，建议复核
                       </span>
-                    </span>
-                  ) : (
-                    <span>
-                      {artifact.city as string}
+                    )}
+                    {artifact.citySource === 'user' && (
                       <span className="ml-2 px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 text-[11px]">
                         按你指定的
                       </span>
-                    </span>
-                  )
+                    )}
+                  </span>
                 }
               />
             )}
-            {typeof artifact?.added === 'number' && (
-              <Row label="入库" value={`${artifact.added} 家店`} />
-            )}
-            {Array.isArray(artifact?.missing) && (artifact!.missing as string[]).length > 0 && (
+            {typeof artifact.added === 'number' && <Row label="入库" value={`${artifact.added} 家店`} />}
+            {Array.isArray(artifact.missing) && (artifact.missing as string[]).length > 0 && (
               <Row
                 label="跳过"
                 value={
                   <span className="text-amber-700">
-                    {(artifact!.missing as string[]).join('、')}（没补到坐标）
+                    {(artifact.missing as string[]).join('、')}（没补到坐标）
                   </span>
                 }
               />
@@ -478,20 +529,18 @@ export default function AutoBuildPanel() {
               value={
                 <span>
                   {VISIBILITY_OPTIONS.find((o) => o.value === shownVisibility)?.label || shownVisibility}
-                  {!artifact?.visibility && (
-                    <span className="ml-2 text-[11px] text-gray-400">按你的选择</span>
-                  )}
+                  {!artifact.visibility && <span className="ml-2 text-[11px] text-gray-400">按你的选择</span>}
                 </span>
               }
             />
           </dl>
-          {finalMessage && (
+          {task?.message && (
             <details className="mb-4">
               <summary className="text-xs text-gray-500 cursor-pointer select-none">
                 Agent 的说明（未入库原因 / 要不要人工核对）
               </summary>
               <pre className="mt-2 text-xs text-gray-600 whitespace-pre-wrap leading-relaxed bg-gray-50 rounded-lg p-3 max-h-60 overflow-auto font-sans">
-                {plain(finalMessage)}
+                {plain(task.message)}
               </pre>
             </details>
           )}
@@ -504,9 +553,7 @@ export default function AutoBuildPanel() {
                 打开合集
               </Link>
             ) : (
-              <span className="flex-1 text-sm text-gray-500">
-                没拿到合集地址，去「我的合集」里看一眼
-              </span>
+              <span className="flex-1 text-sm text-gray-500">没拿到合集地址，去「我的合集」里看一眼</span>
             )}
             <Link
               href="/me"
@@ -523,11 +570,9 @@ export default function AutoBuildPanel() {
       {phase === 'done' && !artifact && (
         <div className="bg-white rounded-2xl border border-amber-200 p-5">
           <p className="font-semibold text-amber-700 mb-2">⚠️ 这次没建成</p>
-          <p className="text-sm text-gray-600 mb-3">
-            Agent 跑完了，但没有产出合集。下面是它的原话：
-          </p>
+          <p className="text-sm text-gray-600 mb-3">Agent 跑完了，但没有产出合集。下面是它的原话：</p>
           <pre className="text-xs text-gray-700 whitespace-pre-wrap leading-relaxed bg-gray-50 rounded-lg p-3 max-h-72 overflow-auto font-sans">
-            {plain(finalMessage) || '（Agent 没有给出说明）'}
+            {plain(task?.message || '') || '（Agent 没有给出说明）'}
           </pre>
           <div className="flex items-center gap-2 mt-4">
             <Link
@@ -548,29 +593,21 @@ export default function AutoBuildPanel() {
 
       {/* 失败 */}
       {phase === 'failed' && (
-        <div className={`bg-white rounded-2xl border p-5 ${maybeDone ? 'border-amber-300' : 'border-red-200'}`}>
-          <p className={`font-semibold mb-2 ${maybeDone ? 'text-amber-700' : 'text-red-600'}`}>
-            {endState === 'input-required'
-              ? '⚠️ Agent 还缺一点信息'
-              : maybeDone
-                ? '⚠️ 平台没收到结果，但任务可能已经跑完了'
-                : '❌ 没生成成功'}
+        <div className={`bg-white rounded-2xl border p-5 ${task?.status === 'CANCELED' ? 'border-gray-200' : 'border-red-200'}`}>
+          <p className={`font-semibold mb-2 ${task?.status === 'CANCELED' ? 'text-gray-600' : 'text-red-600'}`}>
+            {task?.status === 'CANCELED'
+              ? '已中断'
+              : task?.message && /缺|补充/.test(task.message)
+                ? '⚠️ Agent 还缺一点信息'
+                : task?.status === 'STALE'
+                  ? '⚠️ 失去了这轮任务的跟踪'
+                  : '❌ 没生成成功'}
           </p>
           <p className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">{error}</p>
-          {maybeDone && (
+          {task?.status === 'FAILED' && (
             <p className="text-xs text-gray-600 mt-3 bg-amber-50 rounded-lg p-3 leading-relaxed">
-              断的只是平台和 Agent 之间的这条连接，Agent 那边的任务不受影响、通常已经建完了。
-              先去「我的合集」看一眼有没有新出现的合集；确实没有再重试，别白等第二遍。
-            </p>
-          )}
-          {endState === 'input-required' && (
-            <p className="text-xs text-gray-500 mt-3">
-              把缺的信息（比如城市）补进上面的输入框，再点一次「开始生成」。
-            </p>
-          )}
-          {endState === 'rejected' && (
-            <p className="text-xs text-gray-500 mt-3">
-              这类内容 Agent 拒绝处理。换一条链接，或者改用「手动填写」自己建。
+              断开的只是平台和 Agent 之间的连接，Agent 那边的任务可能仍在跑、甚至已经建完。
+              先去「我的合集」看一眼有没有新出现的合集，确实没有再重试。
             </p>
           )}
           <div className="flex items-center gap-2 mt-4">
@@ -599,21 +636,6 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
       <dt className="text-gray-400 w-16 shrink-0">{label}</dt>
       <dd className="text-gray-800">{value}</dd>
     </div>
-  )
-}
-
-/**
- * fetch 层的网络失败。各家浏览器说法不一：Chrome「Failed to fetch」/「network error」，
- * Firefox「NetworkError when attempting to fetch resource.」，Safari「Load failed」，
- * 统一按 TypeError 或关键字识别——这类失败不能等同于「任务没跑起来」。
- */
-function isNetworkError(e: Error & { name?: string }) {
-  const msg = (e?.message || '').toLowerCase()
-  return (
-    e?.name === 'TypeError' ||
-    msg.includes('network') ||
-    msg.includes('failed to fetch') ||
-    msg.includes('load failed')
   )
 }
 

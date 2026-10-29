@@ -428,6 +428,14 @@ npx prisma migrate resolve --applied 20260806104305_init
 
 改 schema 后还要 `npx prisma generate`，否则 TS 类型对不上。
 
+**已自动化**：`scripts/deploy.py` 只在真的上传了新的 `prisma/schema.prisma` 时才执行
+`prisma db push --skip-generate`，失败就中止部署（服务留在旧版本上）；
+`/root/deploy-build.sh` 在 `next build` 之前无条件跑一次 `prisma generate`。
+上面这两条手写命令只在**手工部署**时才需要。
+
+**刻意不加 `--accept-data-loss`**：万一某次变更是删列/删表，脚本会在 db push 这步失败退出，
+不会替人决定丢掉生产数据。真要删，人工上服务器做，并先备份。
+
 ---
 
 ### 坑 9｜内存只有 1.6G，构建时别并发干别的
