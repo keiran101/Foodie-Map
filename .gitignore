@@ -32,6 +32,8 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# 例外：模板要入库，否则新增的配置项没人知道
+!.env.example
 
 # vercel
 .vercel
