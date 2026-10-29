@@ -71,9 +71,23 @@ export async function POST(req: NextRequest) {
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let closed = false
       const push = (obj: unknown) => {
+        if (closed) return
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
       }
+      // 心跳：一轮任务里可能有 60s 以上没有任何事件（比如在转写）。
+      // 长时间静默的连接会被 NAT / 中间层当成死连接掐掉，前端看到的是「突然断了」。
+      // 用 SSE 注释帧（以 `:` 开头）保活，客户端的解析器会直接忽略它。
+      const heartbeat = setInterval(() => {
+        if (closed) return
+        try {
+          controller.enqueue(encoder.encode(': ping\n\n'))
+        } catch {
+          // 控制器已关闭，下一次 tick 会走到 closed 分支
+        }
+      }, 15_000)
+
       try {
         for await (const ev of streamBuildTask(cfg, { source: d.source, data }, req.signal)) {
           push(ev)
@@ -81,6 +95,8 @@ export async function POST(req: NextRequest) {
       } catch (e) {
         push({ type: 'error', message: e instanceof Error ? e.message : String(e) })
       } finally {
+        closed = true
+        clearInterval(heartbeat)
         controller.close()
       }
     },

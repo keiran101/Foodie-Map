@@ -117,7 +117,10 @@ export default function MePage() {
         <div>
           <div className="flex items-center justify-between mb-4">
             <p className="text-sm text-gray-500">共 {maps.length} 个合集</p>
-            <Link href="/maps/new" className="text-sm px-3 py-1.5 rounded-lg bg-orange-500 text-white hover:bg-orange-600">+ 新建合集</Link>
+            <div className="flex items-center gap-2">
+              <Link href="/maps/new?mode=auto" className="text-sm px-3 py-1.5 rounded-lg border border-orange-300 text-orange-600 hover:bg-orange-50">✨ 贴链接生成</Link>
+              <Link href="/maps/new" className="text-sm px-3 py-1.5 rounded-lg bg-orange-500 text-white hover:bg-orange-600">+ 新建合集</Link>
+            </div>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {maps.map((m) => (
@@ -154,7 +157,10 @@ export default function MePage() {
             <div className="text-center py-16 text-gray-400">
               <p className="text-4xl mb-3">🗺️</p>
               <p>还没有合集，创建一个吧！</p>
-              <Link href="/maps/new" className="inline-block mt-4 px-4 py-2 rounded-lg bg-orange-500 text-white text-sm">新建合集</Link>
+              <div className="flex items-center justify-center gap-2 mt-4">
+                <Link href="/maps/new" className="inline-block px-4 py-2 rounded-lg bg-orange-500 text-white text-sm">新建合集</Link>
+                <Link href="/maps/new?mode=auto" className="inline-block px-4 py-2 rounded-lg border border-orange-300 text-orange-600 text-sm">✨ 贴链接生成</Link>
+              </div>
             </div>
           )}
         </div>

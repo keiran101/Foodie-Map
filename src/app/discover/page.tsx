@@ -63,7 +63,24 @@ export default function DiscoverPage() {
 
   return (
     <div className="max-w-5xl mx-auto px-4 py-8">
-      <h1 className="text-2xl font-bold mb-5">发现美食地图</h1>
+      <div className="flex items-start justify-between gap-4 mb-5">
+        <h1 className="text-2xl font-bold">发现美食地图</h1>
+      </div>
+
+      {/* 自动生成入口：贴一条链接就出合集，是这个站最短的一条路 */}
+      <Link
+        href="/maps/new?mode=auto"
+        className="group flex items-center gap-3 mb-5 px-4 py-3 rounded-xl bg-gradient-to-r from-orange-50 to-amber-50 border border-orange-100 hover:border-orange-300 transition"
+      >
+        <span className="text-xl">✨</span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-sm font-medium text-orange-700">贴一条探店视频链接，自动生成美食合集</span>
+          <span className="block text-xs text-orange-600/70 mt-0.5">
+            AI 取文案 · 找店 · 补坐标 · 建图，一分多钟
+          </span>
+        </span>
+        <span className="text-orange-400 group-hover:translate-x-0.5 transition">→</span>
+      </Link>
 
       {/* 搜索与筛选区 */}
       <div className="mb-6 space-y-3">
@@ -143,7 +160,10 @@ export default function DiscoverPage() {
           <p className="text-4xl mb-3">🔍</p>
           <p>{keyword || city ? '没有找到匹配的美食地图，换个关键词试试' : '还没有公开的美食地图，来做第一个吧！'}</p>
           {!keyword && !city && (
-            <Link href="/maps/new" className="inline-block mt-4 px-4 py-2 rounded-lg bg-orange-500 text-white text-sm">新建地图</Link>
+            <div className="flex items-center justify-center gap-2 mt-4">
+              <Link href="/maps/new" className="inline-block px-4 py-2 rounded-lg bg-orange-500 text-white text-sm">新建地图</Link>
+              <Link href="/maps/new?mode=auto" className="inline-block px-4 py-2 rounded-lg border border-orange-300 text-orange-600 text-sm">✨ 贴链接生成</Link>
+            </div>
           )}
         </div>
       )}

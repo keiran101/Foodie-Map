@@ -1,66 +1,58 @@
 'use client'
-import { useState } from 'react'
-import type { FormEvent } from 'react'
-import { useRouter } from 'next/navigation'
-import { api } from '@/lib/client-api'
+import { useEffect, useState } from 'react'
+import AutoBuildPanel from '@/components/AutoBuildPanel'
+import ManualMapForm from '@/components/ManualMapForm'
+
+/**
+ * 一个入口，两种建法。
+ *
+ * 手动：填表 → POST /api/maps，秒级，自己往地图上加店。
+ * 自动：贴一条视频链接/一句清单 → 交给 Agent 跑 → 结果落成同一个「合集」对象。
+ *
+ * 两条路产出的东西完全一样（都是一张 map），所以不分成两个页面 ——
+ * 分页面会让用户以为这是两套东西，实际只是「谁来填这张表」的区别。
+ */
+type Mode = 'manual' | 'auto'
 
 export default function NewMapPage() {
-  const router = useRouter()
-  const [title, setTitle] = useState('')
-  const [city, setCity] = useState('')
-  const [description, setDescription] = useState('')
-  const [visibility, setVisibility] = useState('PUBLIC')
-  const [coverUrl, setCoverUrl] = useState('')
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
+  const [mode, setMode] = useState<Mode>('manual')
 
-  async function onSubmit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault()
-    setBusy(true)
-    setError('')
-    try {
-      const d = await api('/api/maps', { method: 'POST', body: { title, city, description, visibility, coverUrl } })
-      router.push('/maps/' + d.map.id)
-    } catch (err: any) {
-      setError(err.message || '创建失败')
-    } finally {
-      setBusy(false)
-    }
-  }
+  // 用 window.location 而不是 useSearchParams：后者在静态页面里必须包 Suspense，
+  // 为一个初始 tab 引入 Suspense 边界不值当。
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search)
+    if (q.get('mode') === 'auto') setMode('auto')
+  }, [])
 
   return (
-    <div className="max-w-lg mx-auto px-4 py-10">
-      <h1 className="text-2xl font-bold mb-6">创建美食地图</h1>
-      <form onSubmit={onSubmit} className="bg-white rounded-2xl border border-gray-200 p-6 space-y-4">
-        <div>
-          <label className="block text-sm font-medium mb-1">地图名称 *</label>
-          <input required value={title} onChange={(e) => setTitle(e.target.value)} placeholder="例如：周末成都火锅巡礼" className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500" />
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">城市</label>
-          <input value={city} onChange={(e) => setCity(e.target.value)} placeholder="例如：成都（用于搜索店铺）" className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500" />
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">简介</label>
-          <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} placeholder="这张地图是干嘛的？" className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500" />
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">可见性</label>
-          <select value={visibility} onChange={(e) => setVisibility(e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white">
-            <option value="PUBLIC">公开（所有人可见）</option>
-            <option value="UNLISTED">不列出（有链接可看）</option>
-            <option value="PRIVATE">私密（仅自己）</option>
-          </select>
-        </div>
-        <div>
-          <label className="block text-sm font-medium mb-1">封面图 URL（可选）</label>
-          <input value={coverUrl} onChange={(e) => setCoverUrl(e.target.value)} placeholder="https://…（图片直链，用于合集卡片展示）" className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500" />
-        </div>
-        {error && <p className="text-sm text-red-600">{error}</p>}
-        <button type="submit" disabled={busy} className="w-full py-2.5 rounded-lg bg-orange-500 text-white font-medium hover:bg-orange-600 disabled:opacity-60">
-          {busy ? '创建中...' : '创建地图'}
-        </button>
-      </form>
+    <div className="max-w-xl mx-auto px-4 py-10">
+      <h1 className="text-2xl font-bold">新建合集</h1>
+      <p className="text-sm text-gray-400 mt-1 mb-6">自己填，或者把链接丢给 AI</p>
+
+      <div className="flex items-center gap-1 mb-5 border-b border-gray-100">
+        {(
+          [
+            ['manual', '手动填写', '🗺️'],
+            ['auto', '贴链接自动生成', '✨'],
+          ] as const
+        ).map(([key, label, icon]) => (
+          <button
+            key={key}
+            onClick={() => setMode(key)}
+            className={
+              'px-4 py-2 text-sm border-b-2 -mb-px ' +
+              (mode === key
+                ? 'border-orange-500 text-orange-600 font-medium'
+                : 'border-transparent text-gray-500 hover:text-gray-700')
+            }
+          >
+            <span className="mr-1">{icon}</span>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === 'manual' ? <ManualMapForm /> : <AutoBuildPanel />}
     </div>
   )
 }
