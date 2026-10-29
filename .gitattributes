@@ -1,0 +1,6 @@
+# systemd unit 必须是 LF：这个文件会被传到 Linux 上直接当 unit 用，
+# CRLF 会让 systemd 解析失败（报 unknown lvalue 之类，和内容毫不相干）。
+*.service text eol=lf
+# Windows 侧脚本必须 CRLF（cmd.exe 需要），shell 侧必须 LF。
+*.cmd text eol=crlf
+*.sh  text eol=lf
