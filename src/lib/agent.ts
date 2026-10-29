@@ -86,8 +86,14 @@ export type AgentEvent =
   | { type: 'artifact'; data: Record<string, unknown> }
   /** 终态：completed / failed / rejected / input-required */
   | { type: 'done'; state: string; message: string }
-  /** 传输层或协议层错误 */
-  | { type: 'error'; message: string }
+  /**
+   * 传输层或协议层错误。
+   *
+   * `mayHaveProgress` 说明断在哪一环：false = 任务还没真正开始（连不上、凭据错），
+   * true = 中途断的（超时、流被掐断）。后者意味着 **Agent 那边的任务不受影响，
+   * 很可能已经跑完并建好了合集** —— 平台只是没收到结果，调用方不能当成"没做"。
+   */
+  | { type: 'error'; message: string; mayHaveProgress?: boolean }
 
 type Part = { kind?: string; text?: string; data?: Record<string, unknown> }
 
@@ -231,7 +237,22 @@ export async function* streamBuildTask(
     }
 
     if (!sawTerminal) {
-      yield { type: 'error', message: 'Agent 流意外结束，没有收到终态' }
+      // 流正常 EOF 但没给终态：中间层掐断、Agent 重启、或它把 final 帧弄丢了。
+      // 这种情况 Agent 侧的任务往往照常跑完，所以 must 标成 mayHaveProgress。
+      yield {
+        type: 'error',
+        message: '与 Agent 的连接结束了，但没收到最终结果',
+        mayHaveProgress: true,
+      }
+    }
+  } catch (e) {
+    // 读流中途抛错（socket reset / ECONNRESET / 被判定死连接）。同样不能断言任务失败。
+    if (!sawTerminal) {
+      yield {
+        type: 'error',
+        message: `与 Agent 的连接中断：${(e as Error).message}`,
+        mayHaveProgress: true,
+      }
     }
   } finally {
     clearTimeout(timer)

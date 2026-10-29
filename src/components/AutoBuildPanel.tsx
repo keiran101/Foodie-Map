@@ -48,6 +48,14 @@ export default function AutoBuildPanel() {
   const [steps, setSteps] = useState<Step[]>([])
   const [artifact, setArtifact] = useState<Record<string, unknown> | null>(null)
   const [error, setError] = useState('')
+  /**
+   * 「连接断了，但 Agent 那边可能已经建完」。
+   *
+   * 这个状态必须单独记：平台只是没收到结果，Agent 的任务照跑。实测过一次
+   * 8 分钟的任务——前端显示失败，数据库里其实已经躺着一个 8 家店的合集。
+   * 只报「失败」会让用户以为白等了，实际答案在「我的合集」里。
+   */
+  const [maybeDone, setMaybeDone] = useState(false)
   const [endState, setEndState] = useState('')
   const [finalMessage, setFinalMessage] = useState('')
   const [elapsed, setElapsed] = useState(0)
@@ -95,6 +103,7 @@ export default function AutoBuildPanel() {
     setSteps([])
     setArtifact(null)
     setError('')
+    setMaybeDone(false)
     setEndState('')
     setFinalMessage('')
     setElapsed(0)
@@ -110,6 +119,7 @@ export default function AutoBuildPanel() {
     setSteps([])
     setArtifact(null)
     setError('')
+    setMaybeDone(false)
     setEndState('')
     setFinalMessage('')
     setElapsed(0)
@@ -143,6 +153,7 @@ export default function AutoBuildPanel() {
           } else if (ev.type === 'error') {
             settled = true
             setPhase('failed')
+            setMaybeDone(Boolean((ev as { mayHaveProgress?: boolean }).mayHaveProgress))
             setError(ev.message || '出错了')
           } else if (ev.type === 'done') {
             settled = true
@@ -160,7 +171,9 @@ export default function AutoBuildPanel() {
       )
       if (!settled) {
         setPhase('failed')
-        setError('连接结束了，但没收到任务结果（平台可能重启过，或网络被掐断）')
+        // 流结束了却没终态：一律按「可能已建完」处理，见 maybeDone 的注释
+        setMaybeDone(true)
+        setError('连接结束了，但没收到最终结果')
       }
     } catch (e) {
       const err = e as Error & { name?: string }
@@ -356,7 +369,14 @@ export default function AutoBuildPanel() {
       {/* 成功：必须有 artifact 才算建好了。Agent 正常结束但没产出合集时走下面那个分支 */}
       {phase === 'done' && artifact && (
         <div className="bg-white rounded-2xl border border-green-200 p-5">
-          <p className="font-semibold text-green-700 mb-3">✅ 合集建好了</p>
+          <p className="font-semibold text-green-700 mb-3">
+            ✅ 合集建好了
+            {artifact.recovered === true && (
+              <span className="ml-2 align-middle text-[11px] font-normal text-amber-700 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5">
+                连接断过，这份是断流后找回的
+              </span>
+            )}
+          </p>
           <dl className="text-sm space-y-1.5 mb-4">
             {typeof artifact?.title === 'string' && artifact.title && (
               <Row label="标题" value={artifact.title as string} />
@@ -471,11 +491,21 @@ export default function AutoBuildPanel() {
 
       {/* 失败 */}
       {phase === 'failed' && (
-        <div className="bg-white rounded-2xl border border-red-200 p-5">
-          <p className="font-semibold text-red-600 mb-2">
-            {endState === 'input-required' ? '⚠️ Agent 还缺一点信息' : '❌ 没生成成功'}
+        <div className={`bg-white rounded-2xl border p-5 ${maybeDone ? 'border-amber-300' : 'border-red-200'}`}>
+          <p className={`font-semibold mb-2 ${maybeDone ? 'text-amber-700' : 'text-red-600'}`}>
+            {endState === 'input-required'
+              ? '⚠️ Agent 还缺一点信息'
+              : maybeDone
+                ? '⚠️ 平台没收到结果，但任务可能已经跑完了'
+                : '❌ 没生成成功'}
           </p>
           <p className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">{error}</p>
+          {maybeDone && (
+            <p className="text-xs text-gray-600 mt-3 bg-amber-50 rounded-lg p-3 leading-relaxed">
+              断的只是平台和 Agent 之间的这条连接，Agent 那边的任务不受影响、通常已经建完了。
+              先去「我的合集」看一眼有没有新出现的合集；确实没有再重试，别白等第二遍。
+            </p>
+          )}
           {endState === 'input-required' && (
             <p className="text-xs text-gray-500 mt-3">
               把缺的信息（比如城市）补进上面的输入框，再点一次「开始生成」。
@@ -486,6 +516,20 @@ export default function AutoBuildPanel() {
               这类内容 Agent 拒绝处理。换一条链接，或者改用「手动填写」自己建。
             </p>
           )}
+          <div className="flex items-center gap-2 mt-4">
+            <button
+              onClick={reset}
+              className="flex-1 py-2.5 rounded-lg bg-orange-500 text-white font-medium hover:bg-orange-600"
+            >
+              再试一次
+            </button>
+            <Link
+              href="/me"
+              className="px-4 py-2.5 rounded-lg border border-gray-300 text-gray-600 text-sm hover:bg-gray-50"
+            >
+              我的合集
+            </Link>
+          </div>
         </div>
       )}
     </div>

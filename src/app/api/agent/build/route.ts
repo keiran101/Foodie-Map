@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { requireUser } from '@/lib/api-helpers'
 import { signTaskToken } from '@/lib/auth'
 import { agentConfig, streamBuildTask } from '@/lib/agent'
+import { prisma } from '@/lib/prisma'
 
 /**
  * 用视频链接 / 店名清单发起一次「建合集」任务，进度与结果以 SSE 推回。
@@ -117,6 +118,10 @@ export async function POST(req: NextRequest) {
           } else if (ev.type === 'done') {
             finalState = ev.state
             finalMessage = ev.message
+          } else if (ev.type === 'error') {
+            // 漏了这分支的话，日志里状态会永远停在 stream_open，看不出断在哪
+            finalState = ev.mayHaveProgress ? 'stream_error_mid' : 'stream_error'
+            finalMessage = ev.message
           }
           push(ev)
         }
@@ -125,6 +130,50 @@ export async function POST(req: NextRequest) {
         finalMessage = e instanceof Error ? e.message : String(e)
         push({ type: 'error', message: finalMessage })
       } finally {
+        // 断流兜底：平台没收到终态时，用「任务开始之后、属于本用户新建的合集」
+        // 把产物认领回来。判据是 createdAt >= 任务开始时间——这是硬约束，
+        // 不依赖 Agent 回报，也不是"多久之内算相关"那种启发式。
+        //
+        // 为什么必须有这一步：实测过一次 8 分钟的任务，前端显示"失败"，
+        // 数据库里其实已经躺着一个 8 家店的合集。用户以为白等了，
+        // 答案就在「我的合集」里——不该让他自己去翻。
+        if (!artifact && finalState.startsWith('stream_error')) {
+          try {
+            const claimed = await prisma.foodMap.findFirst({
+              where: { ownerId: user.id, createdAt: { gte: new Date(startedAt) } },
+              orderBy: { createdAt: 'desc' },
+              select: {
+                id: true,
+                title: true,
+                city: true,
+                visibility: true,
+                _count: { select: { places: true } },
+              },
+            })
+            if (claimed) {
+              artifact = true
+              added = claimed._count.places
+              finalState = 'recovered'
+              finalMessage = `平台没收到 Agent 的回复，但它在断流之后仍然建好了：${claimed.title}`
+              push({
+                type: 'artifact',
+                data: {
+                  mapId: claimed.id,
+                  city: claimed.city,
+                  visibility: claimed.visibility,
+                  added: claimed._count.places,
+                  recovered: true,
+                },
+              })
+              push({ type: 'done', state: 'completed', message: finalMessage })
+            }
+          } catch (e) {
+            // 查库失败不能把流卡住，前端还有「去我的合集看」的提示兜着
+            console.error(
+              JSON.stringify({ evt: 'agent_task_recover_failed', taskId, error: String(e).slice(0, 200) }),
+            )
+          }
+        }
         console.log(
           JSON.stringify({
             evt: 'agent_task_end',
