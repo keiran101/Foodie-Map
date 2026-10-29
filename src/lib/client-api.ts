@@ -63,17 +63,50 @@ function tryRefresh(): Promise<boolean> {
   return refreshPromise
 }
 
+/**
+ * access token 是否即将/已经过期。
+ *
+ * 只解 payload 读 `exp`，**不做签名校验** —— 签名是服务端的事，这里只用来决定
+ * 「发请求前要不要先续一次期」。别拿它当鉴权。
+ *
+ * 为什么要提前续：access token 只有 15 分钟。有些接口对「带了过期 token」的历史实现是
+ * 静默当匿名（见 api-helpers 的 getAuthState），那种情况下请求不会返回 401，
+ * 客户端的「401 才刷新」永远不会触发，用户看到的是莫名其妙的权限错误。
+ * 提前续期从源头上避免了这一类。
+ */
+function accessTokenExpiringSoon(token: string, skewMs = 60_000): boolean {
+  try {
+    const part = token.split('.')[1]
+    if (!part) return false
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4)
+    const bytes = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0))
+    const payload = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof payload.exp !== 'number') return false
+    return payload.exp * 1000 - Date.now() < skewMs
+  } catch {
+    return false
+  }
+}
+
 export async function api(path: string, opts: { method?: string; body?: unknown } = {}): Promise<any> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  const token = getToken()
+  let token = getToken()
+  // 快过期就先续，省掉一次注定失败的往返
+  let refreshed = false
+  if (token && accessTokenExpiringSoon(token)) {
+    refreshed = await tryRefresh()
+    if (refreshed) token = getToken()
+  }
   if (token) headers['Authorization'] = 'Bearer ' + token
   let res = await fetch(path, {
     method: opts.method ?? 'GET',
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   })
-  // 401：尝试自动刷新后重放一次
-  if (res.status === 401 && token) {
+  // 401：尝试自动刷新后重放一次。
+  // 如果上面已经续过期，这次 401 说明续了也没用（比如用户被删），不再空转一轮。
+  if (res.status === 401 && token && !refreshed) {
     const ok = await tryRefresh()
     if (ok) {
       const freshToken = getToken()

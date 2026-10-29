@@ -76,7 +76,10 @@ export default function MapCanvas({
     if (valid.length === 1) {
       map.setZoomAndCenter(15, [Number(valid[0].lng), Number(valid[0].lat)])
     } else {
-      map.setFitView(markersRef.current, false, [50, 50, 50, 50], 16)
+      // 手机上是正方形小地图，四周还留 50px 的话点会挤在中间一小块里，按宽度收一收
+      const w = containerRef.current ? containerRef.current.clientWidth : 480
+      const pad = w < 420 ? 28 : 50
+      map.setFitView(markersRef.current, false, [pad, pad, pad, pad], 16)
     }
   }
 
@@ -121,7 +124,7 @@ export default function MapCanvas({
 
   if (status === 'placeholder') {
     return (
-      <div className="relative h-[460px] rounded-xl overflow-hidden border border-gray-200 bg-[#eef3f8] flex items-center justify-center">
+      <div className="relative mx-2 md:mx-0 aspect-square md:aspect-auto md:h-[460px] rounded-xl overflow-hidden border border-gray-200 bg-[#eef3f8] flex items-center justify-center">
         <div className="text-center px-6">
           <p className="text-4xl mb-2">🗺️</p>
           <p className="text-sm text-gray-500">占位地图</p>
@@ -137,8 +140,12 @@ export default function MapCanvas({
   }
 
   return (
-    <div className="relative rounded-xl overflow-hidden border border-gray-200">
-      <div ref={containerRef} className="h-[460px] w-full" />
+    <div className="relative mx-2 md:mx-0 rounded-xl overflow-hidden border border-gray-200">
+      {/*
+        手机上收成圆角正方形（宽高相等、左右各多让出一点），
+        桌面端保持原来的 460px 横向大图 —— 大屏上正方形反而浪费横向空间。
+      */}
+      <div ref={containerRef} className="w-full aspect-square md:aspect-auto md:h-[460px]" />
       {status === 'loading' && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-100 text-gray-400 text-sm">
           地图加载中…

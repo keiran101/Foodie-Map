@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { getCurrentUser, requireUser } from '@/lib/api-helpers'
+import { getAuthState, requireUser } from '@/lib/api-helpers'
 import { z } from 'zod'
 
 const updateSchema = z.object({
@@ -13,7 +13,12 @@ const updateSchema = z.object({
 
 export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params
-  const user = await getCurrentUser(req)
+  const { user, staleToken } = await getAuthState(req)
+  // 带着过期 token 来，就不能按匿名处理：先让客户端刷新再重放。
+  // 否则作者打开自己的私密合集，得到的是一句「无权访问」而不是「登录过期」。
+  if (!user && staleToken) {
+    return NextResponse.json({ error: '登录状态已过期，请重试', detail: 'stale_token' }, { status: 401 })
+  }
   const map = await prisma.foodMap.findUnique({
     where: { id },
     include: {
