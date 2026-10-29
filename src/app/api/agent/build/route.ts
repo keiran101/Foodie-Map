@@ -4,7 +4,7 @@ import { z } from 'zod'
 import { requireUser } from '@/lib/api-helpers'
 import { signTaskToken } from '@/lib/auth'
 import { agentConfig, streamBuildTask } from '@/lib/agent'
-import { prisma } from '@/lib/prisma'
+import { claimRecentMap } from '@/lib/agent-claim'
 
 /**
  * 用视频链接 / 店名清单发起一次「建合集」任务，进度与结果以 SSE 推回。
@@ -87,26 +87,52 @@ export async function POST(req: NextRequest) {
     }),
   )
 
+  // closed / heartbeat 必须放在 start() 外面：cancel() 是 ReadableStream 的回调，
+  // 拿不到 start() 里的局部变量。之前它们定义在 start() 内部，客户端一断开就没人清理，
+  // 后续每次 push 都会撞上已关闭的 controller（"Invalid state: Controller is already closed"），
+  // 而 catch 里那次 push 会把异常二次抛出、从 start() 泄漏出去，浏览器看到的就是 network error。
+  let closed = false
+  let heartbeat: ReturnType<typeof setInterval> | null = null
+  /** 客户端走了（关页面 / 刷新 / 切走 / 网络断）。任务不因此中止，只停止写响应。 */
+  let clientGone = false
+
+  const stopWriting = () => {
+    closed = true
+    if (heartbeat) {
+      clearInterval(heartbeat)
+      heartbeat = null
+    }
+  }
+
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      let closed = false
       let finalState = 'stream_open'
       let artifact = false
       let added: unknown = null
       let finalMessage = ''
+      let recovered: string | null = null
+
       const push = (obj: unknown) => {
         if (closed) return
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
+        } catch {
+          // 客户端已经走了：从这里开始不再写，但任务本身要继续跑完并入库。
+          clientGone = true
+          stopWriting()
+        }
       }
+
       // 心跳：一轮任务里可能有 60s 以上没有任何事件（比如在转写）。
       // 长时间静默的连接会被 NAT / 中间层当成死连接掐掉，前端看到的是「突然断了」。
       // 用 SSE 注释帧（以 `:` 开头）保活，客户端的解析器会直接忽略它。
-      const heartbeat = setInterval(() => {
+      heartbeat = setInterval(() => {
         if (closed) return
         try {
           controller.enqueue(encoder.encode(': ping\n\n'))
         } catch {
-          // 控制器已关闭，下一次 tick 会走到 closed 分支
+          clientGone = true
+          stopWriting()
         }
       }, 15_000)
 
@@ -130,50 +156,48 @@ export async function POST(req: NextRequest) {
         finalMessage = e instanceof Error ? e.message : String(e)
         push({ type: 'error', message: finalMessage })
       } finally {
-        // 断流兜底：平台没收到终态时，用「任务开始之后、属于本用户新建的合集」
-        // 把产物认领回来。判据是 createdAt >= 任务开始时间——这是硬约束，
-        // 不依赖 Agent 回报，也不是"多久之内算相关"那种启发式。
+        stopWriting()
+        // 断流兜底：没拿到 artifact、且终态不是「Agent 明确给出结论」的那几种时，
+        // 用「任务开始之后、属于本用户新建的合集」把产物认领回来。
+        // 判据是 createdAt >= 任务开始时间——硬约束，不依赖 Agent 回报，
+        // 也不是"多久之内算相关"那种启发式。
         //
-        // 为什么必须有这一步：实测过一次 8 分钟的任务，前端显示"失败"，
-        // 数据库里其实已经躺着一个 8 家店的合集。用户以为白等了，
-        // 答案就在「我的合集」里——不该让他自己去翻。
-        if (!artifact && finalState.startsWith('stream_error')) {
+        // 为什么必须有这一步：实测过两次（17:50、19:24），前端显示失败，
+        // 数据库里其实已经躺着一个建好的合集。用户以为白等了，答案就在「我的合集」里。
+        const concluded =
+          finalState === 'completed' ||
+          finalState === 'rejected' ||
+          finalState === 'input-required' ||
+          finalState === 'canceled'
+        if (!artifact && !concluded) {
           try {
-            const claimed = await prisma.foodMap.findFirst({
-              where: { ownerId: user.id, createdAt: { gte: new Date(startedAt) } },
-              orderBy: { createdAt: 'desc' },
-              select: {
-                id: true,
-                title: true,
-                city: true,
-                visibility: true,
-                _count: { select: { places: true } },
-              },
-            })
+            const claimed = await claimRecentMap(user.id, startedAt)
             if (claimed) {
               artifact = true
-              added = claimed._count.places
+              added = claimed.added
+              recovered = claimed.mapId
               finalState = 'recovered'
               finalMessage = `平台没收到 Agent 的回复，但它在断流之后仍然建好了：${claimed.title}`
               push({
                 type: 'artifact',
                 data: {
-                  mapId: claimed.id,
+                  mapId: claimed.mapId,
                   city: claimed.city,
                   visibility: claimed.visibility,
-                  added: claimed._count.places,
+                  added: claimed.added,
                   recovered: true,
                 },
               })
               push({ type: 'done', state: 'completed', message: finalMessage })
             }
           } catch (e) {
-            // 查库失败不能把流卡住，前端还有「去我的合集看」的提示兜着
+            // 查库失败不能把流卡死，前端还有「去我的合集看」的提示兜着
             console.error(
               JSON.stringify({ evt: 'agent_task_recover_failed', taskId, error: String(e).slice(0, 200) }),
             )
           }
         }
+        if (clientGone && !recovered) finalState = 'client_gone'
         console.log(
           JSON.stringify({
             evt: 'agent_task_end',
@@ -182,18 +206,26 @@ export async function POST(req: NextRequest) {
             state: finalState,
             hasArtifact: artifact,
             added,
+            // 认领成功但前端已经断了：这条是唯一能对上号的线索，用户报时间就能查
+            recovered,
+            clientGone,
             // 没产出时这段就是唯一线索：Agent 的原话（含它认为的失败原因）
             message: finalMessage.slice(0, 300),
           }),
         )
-        closed = true
-        clearInterval(heartbeat)
-        controller.close()
+        try {
+          controller.close()
+        } catch {
+          // 已经因为取消/错误关掉了
+        }
       }
     },
     cancel() {
-      // 客户端断开：req.signal 会让上游 fetch 中止。
-      // 已知限制：Agent 侧 pi 派生出的 python/ASR 子进程不保证随之回收（backlog #7）。
+      // 客户端断开（关页面 / 刷新 / 切走 / 网络闪断）。
+      // 不中止 Agent 任务：它已经跑起来了，让它跑完并入库，比半路杀掉更有用——
+      // finally 的认领逻辑靠的就是这个。req.signal 会自己掐断我们和 Agent 之间的流。
+      clientGone = true
+      stopWriting()
     },
   })
 

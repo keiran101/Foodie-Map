@@ -63,7 +63,47 @@ export default function AutoBuildPanel() {
   const [probe, setProbe] = useState<'idle' | 'checking' | 'ready' | 'offline' | 'unreachable'>('idle')
 
   const abortRef = useRef<AbortController | null>(null)
+  const pollRef = useRef<number | null>(null)
   const startedAt = useRef(0)
+
+  function stopPolling() {
+    if (pollRef.current !== null) {
+      window.clearTimeout(pollRef.current)
+      pollRef.current = null
+    }
+  }
+
+  /**
+   * 连接断了之后自救：断的只是平台↔Agent 那条 HTTP 流，Agent 的任务没停，
+   * 产物通常几十秒后才入库（实测 19:24 那次：平台 24s 报错，Agent 36s 建完）。
+   * 每 15 秒问一次「任务开始之后有没有新合集」，最多 8 次（约 2 分钟）。
+   *
+   * 判据和服务端断流兜底完全一致（ownerId + createdAt >= 任务开始时刻），
+   * 前端不做任何推断，只是把同一条硬约束用在浏览器侧。
+   */
+  function pollForResult(since: number) {
+    stopPolling()
+    let tries = 0
+    const tick = async () => {
+      pollRef.current = null
+      tries += 1
+      try {
+        const d = await api(`/api/agent/recent?since=${since}`)
+        if (d?.found && d.map) {
+          setArtifact({ ...d.map, recovered: true })
+          setPhase('done')
+          setError('')
+          setMaybeDone(false)
+          return
+        }
+      } catch {
+        // 查不到就静默再等一轮，别再给用户叠一层报错
+      }
+      if (tries < 8) pollRef.current = window.setTimeout(tick, 15_000)
+    }
+    // 先等 8 秒：断流时 Agent 往往刚好在建图，立刻查会扑空
+    pollRef.current = window.setTimeout(tick, 8_000)
+  }
 
   // 探针：先说清楚「Agent 通不通」，别让用户贴上内容等十分钟才发现没接上
   useEffect(() => {
@@ -85,7 +125,13 @@ export default function AutoBuildPanel() {
   }, [phase])
 
   // 离开页面就断开流（Agent 侧不受影响，见文件头第 3 条）
-  useEffect(() => () => abortRef.current?.abort(), [])
+  useEffect(
+    () => () => {
+      abortRef.current?.abort()
+      if (pollRef.current !== null) window.clearTimeout(pollRef.current)
+    },
+    [],
+  )
 
   const mapHref = useMemo(() => {
     if (!artifact) return ''
@@ -99,6 +145,7 @@ export default function AutoBuildPanel() {
   const shownVisibility = ((artifact?.visibility as string | undefined) || visibility)
 
   function reset() {
+    stopPolling()
     setPhase('idle')
     setSteps([])
     setArtifact(null)
@@ -115,6 +162,7 @@ export default function AutoBuildPanel() {
       setError('先贴一条视频链接，或者写一句要做什么')
       return
     }
+    stopPolling()
     setPhase('running')
     setSteps([])
     setArtifact(null)
@@ -174,15 +222,24 @@ export default function AutoBuildPanel() {
         // 流结束了却没终态：一律按「可能已建完」处理，见 maybeDone 的注释
         setMaybeDone(true)
         setError('连接结束了，但没收到最终结果')
+        pollForResult(startedAt.current)
       }
     } catch (e) {
       const err = e as Error & { name?: string }
       setPhase('failed')
-      setError(
-        err?.name === 'AbortError'
-          ? '已中断。注意：Agent 侧可能还在跑，已知限制。'
-          : err?.message || '发起失败',
-      )
+      if (err?.name === 'AbortError') {
+        setMaybeDone(true)
+        setError('已中断。注意：Agent 那边的任务不会跟着停，仍可能建出合集。')
+        pollForResult(startedAt.current)
+      } else if (isNetworkError(err)) {
+        // fetch 层失败：连接被掐、断网、或响应流被服务端异常终止。
+        // 这不等于 Agent 没收到任务——实测两次都是"界面报错、后台已经建好了"。
+        setMaybeDone(true)
+        setError('和平台的连接断了')
+        pollForResult(startedAt.current)
+      } else {
+        setError(err?.message || '发起失败')
+      }
     } finally {
       abortRef.current = null
     }
@@ -542,6 +599,21 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
       <dt className="text-gray-400 w-16 shrink-0">{label}</dt>
       <dd className="text-gray-800">{value}</dd>
     </div>
+  )
+}
+
+/**
+ * fetch 层的网络失败。各家浏览器说法不一：Chrome「Failed to fetch」/「network error」，
+ * Firefox「NetworkError when attempting to fetch resource.」，Safari「Load failed」，
+ * 统一按 TypeError 或关键字识别——这类失败不能等同于「任务没跑起来」。
+ */
+function isNetworkError(e: Error & { name?: string }) {
+  const msg = (e?.message || '').toLowerCase()
+  return (
+    e?.name === 'TypeError' ||
+    msg.includes('network') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('load failed')
   )
 }
 
