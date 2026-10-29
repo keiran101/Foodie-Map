@@ -13,6 +13,9 @@
  * Agent 因此不需要任何长期凭据，权限也不会超出那个用户。
  */
 
+import { request as httpRequest, type IncomingMessage } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+
 /** 从 env 读 Agent 接入配置；缺任一则视为未启用（平台其余功能不受影响）。 */
 export interface AgentConfig {
   /** 穿透后的公网地址，如 https://foodie-agent.example.com（不带尾斜杠） */
@@ -30,6 +33,51 @@ export function agentConfig(): AgentConfig | null {
 
 /** 单任务上限，比 Agent 侧 timeoutMs（默认 10 分钟）略长，留给网络与建图收尾。 */
 const STREAM_TIMEOUT_MS = Number(process.env.AGENT_STREAM_TIMEOUT_MS ?? 12 * 60 * 1000)
+
+/**
+ * 打开 A2A 的 SSE 流。
+ *
+ * 为什么不用 `fetch`：Node 内置 fetch 底层是 undici，它有两个 300s 的默认值
+ * （headersTimeout / bodyTimeout）。`bodyTimeout` 限制的是**两个数据块之间的最大间隔**。
+ * 实测踩过：6 分 52 秒的视频在 ASR 转写阶段 5 分钟没发任何事件，连接被判死，
+ * 前端拿到的是 `terminated`，堆栈里看不出是超时，只看到「Agent 流意外结束」。
+ * fetch 没有暴露这个参数，为一个参数装 undici 不值当；node:http 本来就没有这层限制。
+ *
+ * 读流仍然受上层 `STREAM_TIMEOUT_MS` 和 `req.signal` 控制，不会无限挂住。
+ */
+function openStream(
+  url: string,
+  body: string,
+  token: string,
+  signal: AbortSignal,
+): Promise<{ status: number; stream: IncomingMessage }> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url)
+    const send = target.protocol === 'https:' ? httpsRequest : httpRequest
+    const req = send(
+      target,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'text/event-stream',
+          authorization: `Bearer ${token}`,
+          'content-length': Buffer.byteLength(body),
+        },
+      },
+      (res) => resolve({ status: res.statusCode ?? 0, stream: res }),
+    )
+    // 0 = 不设 socket 空闲超时；任务级上限交给外面的 timer
+    req.setTimeout(0)
+    req.on('error', reject)
+    if (signal.aborted) {
+      req.destroy(new Error('aborted'))
+      return
+    }
+    signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true })
+    req.end(body)
+  })
+}
 
 export type AgentEvent =
   /** 进度：state 恒为 working，message 是给用户看的一句话 */
@@ -76,16 +124,11 @@ export async function* streamBuildTask(
   signal?.addEventListener('abort', onAbort)
   const timer = setTimeout(() => abort.abort(), STREAM_TIMEOUT_MS)
 
-  let res: Response
+  let open: { status: number; stream: IncomingMessage }
   try {
-    res = await fetch(`${cfg.baseUrl}/a2a/jsonrpc`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'text/event-stream',
-        authorization: `Bearer ${cfg.token}`,
-      },
-      body: JSON.stringify({
+    open = await openStream(
+      `${cfg.baseUrl}/a2a/jsonrpc`,
+      JSON.stringify({
         jsonrpc: '2.0',
         id: crypto.randomUUID(),
         method: 'message/stream',
@@ -98,8 +141,9 @@ export async function* streamBuildTask(
           },
         },
       }),
-      signal: abort.signal,
-    })
+      cfg.token,
+      abort.signal,
+    )
   } catch (e) {
     clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
@@ -107,29 +151,28 @@ export async function* streamBuildTask(
     return
   }
 
-  if (res.status === 401) {
+  if (open.status === 401) {
+    open.stream.resume()
     clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
     yield { type: 'error', message: 'Agent 拒绝了凭据（401）：检查 AGENT_A2A_TOKEN 是否与 Agent 侧一致' }
     return
   }
-  if (!res.ok || !res.body) {
+  if (open.status < 200 || open.status >= 300) {
+    open.stream.resume() // 排掉 body，否则这条连接会一直挂着
     clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
-    yield { type: 'error', message: `Agent 返回 HTTP ${res.status}` }
+    yield { type: 'error', message: `Agent 返回 HTTP ${open.status}` }
     return
   }
 
-  const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
   let sawTerminal = false
 
   try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
+    for await (const chunk of open.stream) {
+      buf += decoder.decode(chunk as Buffer, { stream: true })
 
       let idx: number
       while ((idx = buf.indexOf('\n\n')) >= 0) {
@@ -193,7 +236,8 @@ export async function* streamBuildTask(
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
-    reader.cancel().catch(() => {})
+    // 提前 break（拿到终态）时流还开着，得主动断，否则 socket 挂到超时
+    open.stream.destroy()
   }
 }
 
