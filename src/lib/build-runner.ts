@@ -20,6 +20,9 @@ import { prisma } from '@/lib/prisma'
 /** 进度落库的合并间隔。一轮任务实测几十条事件，逐条 UPDATE 没必要，1.5s 一次足够 */
 const FLUSH_MS = 1500
 
+/** 存活心跳间隔。必须明显小于 build-task 的 STALE_AFTER_MS（6 分钟） */
+const TOUCH_MS = 45 * 1000
+
 interface RunningTask {
   ctl: AbortController
   /** 用户主动点了「中断」。收尾时必须写 CANCELED，不能写成失败 */
@@ -113,6 +116,23 @@ async function execute(taskId: string, entry: RunningTask): Promise<void> {
 
   const timer = setInterval(flush, FLUSH_MS)
 
+  /**
+   * 存活心跳：每 45 秒无条件碰一下 updatedAt。
+   *
+   * 没有它，「失去跟踪」的判据会退化成「多久没进度」—— 而 ASR 转写阶段实测能静默
+   * 252 秒一条事件都没有，那个判据就不可靠了。有了它，updatedAt 衡量的是
+   * **执行器进程还活着吗**，reapStaleTasks 的 6 分钟阈值才有意义。
+   */
+  const heartbeat = setInterval(() => {
+    chain = chain
+      .then(() =>
+        prisma.buildTask
+          .update({ where: { id: taskId }, data: { updatedAt: new Date() } })
+          .then(() => undefined),
+      )
+      .catch(() => undefined)
+  }, TOUCH_MS)
+
   let finalState = 'stream_open'
   let finalMessage = ''
   let artifact: Record<string, unknown> | null = null
@@ -121,6 +141,7 @@ async function execute(taskId: string, entry: RunningTask): Promise<void> {
   const cfg = agentConfig()
   if (!cfg) {
     clearInterval(timer)
+    clearInterval(heartbeat)
     await finish(taskId, {
       status: 'FAILED',
       error: 'Agent 未接入：缺少 AGENT_A2A_BASE_URL / AGENT_A2A_TOKEN',
@@ -161,6 +182,7 @@ async function execute(taskId: string, entry: RunningTask): Promise<void> {
     transportError = e instanceof Error ? e.message : String(e)
   } finally {
     clearInterval(timer)
+    clearInterval(heartbeat)
   }
 
   // 中断判定要在写终态之前：cancelBuildTask 会把 abort 打进来，

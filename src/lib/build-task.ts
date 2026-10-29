@@ -14,11 +14,12 @@ import { claimRecentMap } from '@/lib/agent-claim'
  */
 
 /**
- * 多久没有进度更新就认为「失去跟踪」。
+ * 多久没动静就认为「失去跟踪」。
  *
- * 取值依据：实测一轮 1–7 分钟，其中最长的一段静默是 ASR 拉流，实测 252s 没有任何事件。
- * 因此阈值必须明显大于 252s，否则会把正在安静转写的任务误判成死任务。
- * 取 6 分钟：比最长静默多留 1 分钟余量，同时又不至于让用户对着一个已经死掉的任务干等。
+ * 判据是 `updatedAt`，而执行器每 45 秒会**无条件**碰一次它（见 build-runner 的
+ * 存活心跳），所以这个阈值衡量的是「执行器进程还活着吗」，不是「多久没进度」。
+ * 这一点很重要：ASR 转写阶段实测能静默 252 秒零事件，用「多久没进度」当判据会误杀。
+ * 取 6 分钟 = 心跳间隔的 8 倍，允许丢几次心跳，又不至于让用户对着死任务干等。
  */
 export const STALE_AFTER_MS = 6 * 60 * 1000
 
@@ -128,44 +129,52 @@ export async function reapStaleTasks(userId: string): Promise<number> {
     orderBy: { createdAt: 'desc' },
     take: 5,
   })
-  let reaped = 0
   for (const t of stale) {
-    let data: Prisma.BuildTaskUpdateInput
-    try {
-      const claimed = await claimRecentMap(userId, t.createdAt.getTime())
-      data = claimed
-        ? {
-            status: 'COMPLETED',
-            mapId: claimed.mapId,
-            result: {
-              mapId: claimed.mapId,
-              title: claimed.title,
-              city: claimed.city,
-              added: claimed.added,
-              visibility: claimed.visibility,
-              recovered: true,
-            },
-            message: `平台在这轮任务结束前就重启了，但它在失去跟踪之后仍然建好了：${claimed.title}`,
-            finishedAt: new Date(),
-          }
-        : {
-            status: 'STALE',
-            error: '平台重启后失去了这轮任务的跟踪，也没找到对应产物。先去「我的合集」确认，再决定要不要重试。',
-            finishedAt: new Date(),
-          }
-    } catch {
-      data = {
-        status: 'STALE',
-        error: '平台重启后失去了这轮任务的跟踪（回收时查库失败）。',
-        finishedAt: new Date(),
-      }
-    }
-    await prisma.buildTask
-      .update({ where: { id: t.id }, data })
-      .catch(() => undefined)
-    reaped += 1
+    await reapTask(t)
   }
-  return reaped
+  return stale.length
+}
+
+/**
+ * 判定一条 RUNNING 任务已经没人管，并收尾。
+ *
+ * 回收时**仍然要试着把产物找回来** —— Agent 不在这个进程里，它多半已经建好了，
+ * 判据与断流兜底完全一致（ownerId + createdAt >= 任务开始时刻）。
+ *
+ * 单独导出是为了让「发新任务时发现旧任务僵死」也能立刻调它，不必干等 6 分钟阈值。
+ */
+export async function reapTask(t: BuildTask): Promise<void> {
+  let data: Prisma.BuildTaskUpdateInput
+  try {
+    const claimed = await claimRecentMap(t.userId, t.createdAt.getTime())
+    data = claimed
+      ? {
+          status: 'COMPLETED',
+          mapId: claimed.mapId,
+          result: {
+            mapId: claimed.mapId,
+            title: claimed.title,
+            city: claimed.city,
+            added: claimed.added,
+            visibility: claimed.visibility,
+            recovered: true,
+          },
+          message: `平台在这轮任务结束前就重启了，但它在失去跟踪之后仍然建好了：${claimed.title}`,
+          finishedAt: new Date(),
+        }
+      : {
+          status: 'STALE',
+          error: '平台重启后失去了这轮任务的跟踪，也没找到对应产物。先去「我的合集」确认，再决定要不要重试。',
+          finishedAt: new Date(),
+        }
+  } catch {
+    data = {
+      status: 'STALE',
+      error: '平台重启后失去了这轮任务的跟踪（回收时查库失败）。',
+      finishedAt: new Date(),
+    }
+  }
+  await prisma.buildTask.update({ where: { id: t.id }, data }).catch(() => undefined)
 }
 
 export interface SerializedBuildTask {

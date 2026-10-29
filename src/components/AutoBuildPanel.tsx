@@ -233,9 +233,8 @@ export default function AutoBuildPanel() {
     setError('')
     setElapsed(0)
     setResumed(false)
-    setSource('')
-    setTitle('')
-    setCity('')
+    // 刻意不清 source / city / title：用户点「再做一个」多半是想改一处重试，
+    // 把输入框清空等于逼他重贴一遍链接。
   }
 
   async function start() {
@@ -611,15 +610,17 @@ export default function AutoBuildPanel() {
             </p>
           )}
           <div className="flex items-center gap-2 mt-4">
-            <button
-              onClick={reset}
-              className="flex-1 py-2.5 rounded-lg bg-orange-500 text-white font-medium hover:bg-orange-600"
-            >
-              再试一次
-            </button>
+            {task && (
+              <button
+                onClick={reset}
+                className="flex-1 py-2.5 rounded-lg bg-orange-500 text-white font-medium hover:bg-orange-600"
+              >
+                再做一个
+              </button>
+            )}
             <Link
               href="/me"
-              className="px-4 py-2.5 rounded-lg border border-gray-300 text-gray-600 text-sm hover:bg-gray-50"
+              className="flex-1 text-center px-4 py-2.5 rounded-lg border border-gray-300 text-gray-600 text-sm hover:bg-gray-50"
             >
               我的合集
             </Link>

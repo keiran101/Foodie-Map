@@ -2,11 +2,12 @@ import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { requireUser } from '@/lib/api-helpers'
 import { agentConfig } from '@/lib/agent'
-import { launchBuildTask } from '@/lib/build-runner'
+import { launchBuildTask, isTaskRunning } from '@/lib/build-runner'
 import {
   createBuildTask,
   findRunningTask,
   reapStaleTasks,
+  reapTask,
   serializeTask,
 } from '@/lib/build-task'
 
@@ -71,10 +72,17 @@ export async function POST(req: NextRequest) {
   // 返回 409 而不是静默新建 —— 前端据此直接"接回"那条任务，用户不会白等第二轮。
   const running = await findRunningTask(user.id)
   if (running) {
-    return NextResponse.json(
-      { task: serializeTask(running), reused: true },
-      { status: 409, headers: { 'cache-control': 'no-store' } },
-    )
+    // 单进程部署，内存里有没有执行器就是权威判断。
+    // 没有 = 进程重启过，这条任务永远不会再有进度了 —— 立刻收尾（并试着认领产物），
+    // 而不是让用户干等 6 分钟的 STALE 阈值。
+    if (!isTaskRunning(running.id)) {
+      await reapTask(running)
+    } else {
+      return NextResponse.json(
+        { task: serializeTask(running), reused: true },
+        { status: 409, headers: { 'cache-control': 'no-store' } },
+      )
+    }
   }
 
   const task = await createBuildTask({
